@@ -60,19 +60,19 @@ def hc_split_sinkhorn(mixes, hc_scale, hc_base, hc_mult, hc_sinkhorn_iters, hc_e
     """
     Pure PyTorch implementation of Sinkhorn splitting for Hyper-Connections.
     """
-    pre_logits = mixes[:, :hc_mult] * hc_scale[0] + hc_base[:hc_mult]
-    post_logits = mixes[:, hc_mult:2*hc_mult] * hc_scale[1] + hc_base[hc_mult:2*hc_mult]
-    comb_logits = mixes[:, 2*hc_mult:] * hc_scale[2] + hc_base[2*hc_mult:]
+    pre_logits = mixes[..., :hc_mult] * hc_scale[0] + hc_base[:hc_mult]
+    post_logits = mixes[..., hc_mult:2*hc_mult] * hc_scale[1] + hc_base[hc_mult:2*hc_mult]
+    comb_logits = mixes[..., 2*hc_mult:] * hc_scale[2] + hc_base[2*hc_mult:]
     
     pre = torch.sigmoid(pre_logits) + hc_eps
-    post = torch.sigmoid(post_logits) + hc_eps
+    post = 2 * torch.sigmoid(post_logits)
     
-    comb = comb_logits.view(-1, hc_mult, hc_mult)
-    log_P = comb
-    for _ in range(hc_sinkhorn_iters):
-        log_P = log_P - torch.logsumexp(log_P, dim=-1, keepdim=True)
-        log_P = log_P - torch.logsumexp(log_P, dim=-2, keepdim=True)
-    comb = torch.exp(log_P)
+    comb = comb_logits.view(*mixes.shape[:-1], hc_mult, hc_mult)
+    comb = F.softmax(comb, dim=-1) + hc_eps
+    comb = comb / (comb.sum(dim=-2, keepdim=True) + hc_eps)
+    for _ in range(hc_sinkhorn_iters - 1):
+        comb = comb / (comb.sum(dim=-1, keepdim=True) + hc_eps)
+        comb = comb / (comb.sum(dim=-2, keepdim=True) + hc_eps)
     
     return pre, post, comb
 
@@ -230,6 +230,7 @@ class Compressor(nn.Module):
         coff = 1 + self.overlap
 
         self.ape = nn.Parameter(torch.empty(compress_ratio, coff * self.head_dim, dtype=torch.float32))
+        nn.init.zeros_(self.ape)
         self.wkv = nn.Linear(self.dim, coff * self.head_dim, bias=False)
         self.wgate = nn.Linear(self.dim, coff * self.head_dim, bias=False)
         self.norm = RMSNorm(self.head_dim, config.norm_eps)
@@ -386,6 +387,7 @@ class Attention(nn.Module):
         self.eps = config.norm_eps
 
         self.attn_sink = nn.Parameter(torch.empty(self.n_heads, dtype=torch.float32))
+        nn.init.zeros_(self.attn_sink)
         self.wq_a = nn.Linear(self.dim, self.q_lora_rank, bias=False)
         self.q_norm = RMSNorm(self.q_lora_rank, self.eps)
         self.wq_b = nn.Linear(self.q_lora_rank, self.n_heads * self.head_dim, bias=False)
@@ -469,7 +471,7 @@ class Attention(nn.Module):
             
         apply_rotary_emb(o[..., -rd:], freqs_cis, True)
 
-        o = o.view(bsz, seqlen, self.n_groups, -1)
+        o = o.reshape(bsz, seqlen, self.n_groups, -1)
         wo_a = self.wo_a.weight.view(self.n_groups, self.o_lora_rank, -1)
         o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
         x = self.wo_b(o.flatten(2))
@@ -485,11 +487,13 @@ class Gate(nn.Module):
         self.route_scale = config.route_scale
         self.hash = layer_id < config.n_hash_layers
         self.weight = nn.Parameter(torch.empty(config.num_routed_experts, config.hidden_size))
+        nn.init.normal_(self.weight, std=0.02)
         if self.hash:
-            self.tid2eid = nn.Parameter(torch.empty(config.vocab_size, config.num_activated_experts, dtype=torch.int32), requires_grad=False)
+            self.tid2eid = nn.Parameter(torch.randint(0, config.num_routed_experts, (config.vocab_size, config.num_activated_experts), dtype=torch.int32), requires_grad=False)
             self.bias = None
         else:
             self.bias = nn.Parameter(torch.empty(config.num_routed_experts, dtype=torch.float32))
+            nn.init.zeros_(self.bias)
 
     def forward(self, x: torch.Tensor, input_ids: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         scores = F.linear(x.float(), self.weight.float())
@@ -587,11 +591,17 @@ class Block(nn.Module):
         hc_dim = self.hc_mult * config.hidden_size
         
         self.hc_attn_fn = nn.Parameter(torch.empty(mix_hc, hc_dim, dtype=torch.float32))
+        nn.init.normal_(self.hc_attn_fn, std=0.02)
         self.hc_ffn_fn = nn.Parameter(torch.empty(mix_hc, hc_dim, dtype=torch.float32))
+        nn.init.normal_(self.hc_ffn_fn, std=0.02)
         self.hc_attn_base = nn.Parameter(torch.empty(mix_hc, dtype=torch.float32))
+        nn.init.zeros_(self.hc_attn_base)
         self.hc_ffn_base = nn.Parameter(torch.empty(mix_hc, dtype=torch.float32))
+        nn.init.zeros_(self.hc_ffn_base)
         self.hc_attn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
+        nn.init.ones_(self.hc_attn_scale)
         self.hc_ffn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
+        nn.init.ones_(self.hc_ffn_scale)
 
     def hc_pre(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor):
         shape, dtype = x.size(), x.dtype
@@ -629,6 +639,7 @@ class ParallelHead(nn.Module):
         self.norm_eps = norm_eps
         self.hc_eps = hc_eps
         self.weight = nn.Parameter(torch.empty(vocab_size, dim, dtype=torch.float32))
+        nn.init.normal_(self.weight, std=0.02)
 
     def get_logits(self, x):
         return F.linear(x[:, -1].float(), self.weight)
@@ -643,7 +654,7 @@ class ParallelHead(nn.Module):
         x = x.flatten(2).float()
         rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
         mixes = F.linear(x, hc_fn) * rsqrt
-        pre = torch.sigmoid(mixes * hc_scale + hc_base) + self.hc_eps
+        pre = torch.sigmoid(mixes * hc_scale[0] + hc_base) + self.hc_eps
         y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=2)
         return y.to(dtype)
 
@@ -660,8 +671,11 @@ class MTPBlock(Block):
         hc_dim = self.hc_mult * config.hidden_size
         
         self.hc_head_fn = nn.Parameter(torch.empty(self.hc_mult, hc_dim, dtype=torch.float32))
+        nn.init.normal_(self.hc_head_fn, std=0.02)
         self.hc_head_base = nn.Parameter(torch.empty(self.hc_mult, dtype=torch.float32))
+        nn.init.zeros_(self.hc_head_base)
         self.hc_head_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
+        nn.init.ones_(self.hc_head_scale)
         self.embed = None
         self.head = None
 
@@ -715,8 +729,11 @@ class DeepSeekV4MiniForCausalLM(PreTrainedModel, GenerationMixin):
         hc_dim = self.hc_mult * config.hidden_size
         
         self.hc_head_fn = nn.Parameter(torch.empty(self.hc_mult, hc_dim, dtype=torch.float32))
+        nn.init.normal_(self.hc_head_fn, std=0.02)
         self.hc_head_base = nn.Parameter(torch.empty(self.hc_mult, dtype=torch.float32))
+        nn.init.zeros_(self.hc_head_base)
         self.hc_head_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
+        nn.init.ones_(self.hc_head_scale)
 
         self.apply(self._init_weights)
 

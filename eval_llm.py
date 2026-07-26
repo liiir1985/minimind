@@ -17,10 +17,19 @@ def init_model(args):
     if 'model' in args.load_from:
         if args.model_type == 'dsv4_mini':
             from model.model_dsv4_mini import DeepSeekV4MiniConfig, DeepSeekV4MiniForCausalLM
-            model = DeepSeekV4MiniForCausalLM(DeepSeekV4MiniConfig(
-                hidden_size=args.hidden_size,
-                num_hidden_layers=args.num_hidden_layers
-            ))
+            is_micro = args.hidden_size < 768
+            lm_config = DeepSeekV4MiniConfig(
+                hidden_size=args.hidden_size, 
+                num_hidden_layers=args.num_hidden_layers,
+                num_attention_heads=args.hidden_size // 128 if args.hidden_size % 128 == 0 else 4,
+                moe_inter_dim=args.hidden_size,
+                q_lora_rank=(args.hidden_size // 3 // 16 * 16) if is_micro else 256,
+                o_lora_rank=(args.hidden_size // 3 // 16 * 16) if is_micro else 256,
+                num_routed_experts=16 if is_micro else 32,
+                hc_mult=2 if is_micro else 4,
+                n_mtp_layers=0 if is_micro else 1,
+            )
+            model = DeepSeekV4MiniForCausalLM(lm_config)
             moe_suffix = ''
         else:
             model = MiniMindForCausalLM(MiniMindConfig(
