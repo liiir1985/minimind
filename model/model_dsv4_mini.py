@@ -607,8 +607,8 @@ class Block(nn.Module):
         shape, dtype = x.size(), x.dtype
         x_flat = x.flatten(2).float()
         rsqrt = torch.rsqrt(x_flat.square().mean(-1, keepdim=True) + self.norm_eps)
-        mixes = F.linear(x_flat, hc_fn) * rsqrt
-        pre, post, comb = hc_split_sinkhorn(mixes, hc_scale, hc_base, self.hc_mult, self.hc_sinkhorn_iters, self.hc_eps)
+        mixes = F.linear(x_flat, hc_fn.float()) * rsqrt
+        pre, post, comb = hc_split_sinkhorn(mixes, hc_scale.float(), hc_base.float(), self.hc_mult, self.hc_sinkhorn_iters, self.hc_eps)
         y = torch.sum(pre.unsqueeze(-1) * x_flat.view(shape), dim=2)
         return y.to(dtype), post, comb
 
@@ -642,19 +642,19 @@ class ParallelHead(nn.Module):
         nn.init.normal_(self.weight, std=0.02)
 
     def get_logits(self, x):
-        return F.linear(x[:, -1].float(), self.weight)
+        return F.linear(x[:, -1].float(), self.weight.float())
 
     def forward(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor, norm: RMSNorm):
         x = self.hc_head(x, hc_fn, hc_scale, hc_base)
-        logits = F.linear(norm(x).float(), self.weight)
+        logits = F.linear(norm(x).float(), self.weight.float())
         return logits
 
     def hc_head(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor):
         shape, dtype = x.size(), x.dtype
         x = x.flatten(2).float()
         rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
-        mixes = F.linear(x, hc_fn) * rsqrt
-        pre = torch.sigmoid(mixes * hc_scale[0] + hc_base) + self.hc_eps
+        mixes = F.linear(x, hc_fn.float()) * rsqrt
+        pre = torch.sigmoid(mixes * hc_scale[0].float() + hc_base.float()) + self.hc_eps
         y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=2)
         return y.to(dtype)
 
