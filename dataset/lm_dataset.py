@@ -5,6 +5,7 @@ import os
 import random
 from datasets import load_dataset, Features, Sequence, Value
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["HF_DATASETS_CACHE"] = "e:/myexe/minimind/dataset/hf_cache"
 
 def pre_processing_chat(conversations, add_system_ratio=0.2):
     # tool use 数据完整保留不做处理
@@ -39,17 +40,99 @@ class PretrainDataset(Dataset):
         super().__init__()
         self.tokenizer = tokenizer
         self.max_length = max_length
-        self.samples = load_dataset('json', data_files=data_path, split='train')
+        self.samples = []
+        
+        cache_path = data_path + f".packed_{max_length}.pt"
+        
+        import torch.distributed as dist
+        is_dist = dist.is_initialized()
+        rank = dist.get_rank() if is_dist else 0
+        
+        if rank == 0:
+            if not os.path.exists(cache_path):
+                print(f"Building packed dataset to {cache_path}...")
+                raw_samples = load_dataset('json', data_files=data_path, split='train')
+                
+                def tokenize_fn(examples):
+                    texts = [str(t) for t in examples['text']]
+                    batch_encoded = tokenizer(texts, add_special_tokens=False)
+                    batch_tokens = []
+                    batch_lengths = []
+                    
+                    for tokens in batch_encoded.input_ids:
+                        tokens = [tokenizer.bos_token_id] + tokens + [tokenizer.eos_token_id]
+                        if len(tokens) > max_length:
+                            stride = max_length
+                            for i in range(0, len(tokens), stride):
+                                chunk = tokens[i:i + max_length]
+                                batch_tokens.append(chunk)
+                                batch_lengths.append(len(chunk))
+                        else:
+                            batch_tokens.append(tokens)
+                            batch_lengths.append(len(tokens))
+                    return {'tokens': batch_tokens, 'length': batch_lengths}
+                
+                print("Tokenizing and chunking dataset...")
+                tokenized_dataset = raw_samples.map(
+                    tokenize_fn, 
+                    batched=True, 
+                    batch_size=1000, 
+                    remove_columns=raw_samples.column_names,
+                    desc="Tokenizing dataset"
+                )
+                
+                print("Sorting sequences for optimal packing (First-Fit Decreasing)...")
+                lengths_and_indices = [(length, i) for i, length in enumerate(tokenized_dataset['length'])]
+                lengths_and_indices.sort(key=lambda x: x[0], reverse=True)
+                
+                print("Packing sequences into bins...")
+                from tqdm import tqdm
+                bins = [] 
+                bin_sums = [] 
+                active_bin_indices = []
+                
+                # 为极大提升打包速度，当bin的剩余空间小于100时直接移出活跃队列
+                min_seq_length = lengths_and_indices[-1][0] if lengths_and_indices else 0
+                drop_threshold = max(100, min_seq_length)
+                
+                for length, idx in tqdm(lengths_and_indices, desc="Packing sequences"):
+                    tokens = tokenized_dataset[idx]['tokens']
+                    placed = False
+                    for i in range(len(active_bin_indices)):
+                        active_idx = active_bin_indices[i]
+                        if bin_sums[active_idx] + length <= max_length:
+                            bins[active_idx].extend(tokens)
+                            bin_sums[active_idx] += length
+                            placed = True
+                            if max_length - bin_sums[active_idx] < drop_threshold:
+                                active_bin_indices.pop(i)
+                            break
+                    if not placed:
+                        bins.append(tokens)
+                        bin_sums.append(length)
+                        if max_length - length >= drop_threshold:
+                            active_bin_indices.append(len(bins) - 1)
+                        
+                print(f"Packed {len(tokenized_dataset)} sequences into {len(bins)} bins.")
+                torch.save(bins, cache_path)
+                print(f"Saved packed dataset to {cache_path}")
+        
+        if is_dist:
+            dist.barrier()
+            
+        print(f"Loading packed dataset from {cache_path}")
+        self.samples = torch.load(cache_path)
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, index):
-        sample = self.samples[index]
-        tokens = self.tokenizer(str(sample['text']), add_special_tokens=False, max_length=self.max_length - 2, truncation=True).input_ids
-        tokens = [self.tokenizer.bos_token_id] + tokens + [self.tokenizer.eos_token_id]
-        input_ids = tokens + [self.tokenizer.pad_token_id] * (self.max_length - len(tokens))
-        input_ids = torch.tensor(input_ids, dtype=torch.long)
+        packed_ids = self.samples[index].copy() 
+        remaining_len = self.max_length - len(packed_ids)
+        if remaining_len > 0:
+            packed_ids.extend([self.tokenizer.pad_token_id] * remaining_len)
+            
+        input_ids = torch.tensor(packed_ids, dtype=torch.long)
         labels = input_ids.clone()
         labels[input_ids == self.tokenizer.pad_token_id] = -100
         return input_ids, labels

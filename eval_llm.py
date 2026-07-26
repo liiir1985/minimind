@@ -12,13 +12,21 @@ warnings.filterwarnings('ignore')
 def init_model(args):
     tokenizer = AutoTokenizer.from_pretrained(args.load_from)
     if 'model' in args.load_from:
-        model = MiniMindForCausalLM(MiniMindConfig(
-            hidden_size=args.hidden_size,
-            num_hidden_layers=args.num_hidden_layers,
-            use_moe=bool(args.use_moe),
-            inference_rope_scaling=args.inference_rope_scaling
-        ))
-        moe_suffix = '_moe' if args.use_moe else ''
+        if args.model_type == 'dsv4_mini':
+            from model.model_dsv4_mini import DeepSeekV4MiniConfig, DeepSeekV4MiniForCausalLM
+            model = DeepSeekV4MiniForCausalLM(DeepSeekV4MiniConfig(
+                hidden_size=args.hidden_size,
+                num_hidden_layers=args.num_hidden_layers
+            ))
+            moe_suffix = ''
+        else:
+            model = MiniMindForCausalLM(MiniMindConfig(
+                hidden_size=args.hidden_size,
+                num_hidden_layers=args.num_hidden_layers,
+                use_moe=bool(args.use_moe),
+                inference_rope_scaling=args.inference_rope_scaling
+            ))
+            moe_suffix = '_moe' if args.use_moe else ''
         ckp = f'./{args.save_dir}/{args.weight}_{args.hidden_size}{moe_suffix}.pth'
         model.load_state_dict(torch.load(ckp, map_location=args.device), strict=True)
         if args.lora_weight != 'None':
@@ -46,6 +54,7 @@ def main():
     parser.add_argument('--historys', default=0, type=int, help="携带历史对话轮数（需为偶数，0表示不携带历史）")
     parser.add_argument('--show_speed', default=1, type=int, help="显示decode速度（tokens/s）")
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu', type=str, help="运行设备")
+    parser.add_argument('--model_type', default='minimind', type=str, choices=['minimind', 'dsv4_mini'], help="模型类型")
     args = parser.parse_args()
     
     prompts = [
