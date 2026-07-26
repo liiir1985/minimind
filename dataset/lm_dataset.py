@@ -4,6 +4,7 @@ import json
 import os
 import random
 from datasets import load_dataset, Features, Sequence, Value
+import numpy as np
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["HF_DATASETS_CACHE"] = "e:/myexe/minimind/dataset/hf_cache"
 
@@ -42,7 +43,7 @@ class PretrainDataset(Dataset):
         self.max_length = max_length
         self.samples = []
         
-        cache_path = data_path + f".packed_{max_length}.pt"
+        cache_path = data_path + f".packed_{max_length}.npy"
         
         import torch.distributed as dist
         is_dist = dist.is_initialized()
@@ -85,10 +86,11 @@ class PretrainDataset(Dataset):
                 lengths_and_indices = [(length, i) for i, length in enumerate(tokenized_dataset['length'])]
                 lengths_and_indices.sort(key=lambda x: x[0], reverse=True)
                 
-                print("Packing sequences into bins (Bucketed Best-Fit)...")
+                print("Packing sequences into bins (Bucketed Best-Fit) with Numpy Memmap...")
                 from tqdm import tqdm
                 bins = [] 
                 bin_sums = [] 
+                pad_token = tokenizer.pad_token_id
                 
                 # 为极大提升打包速度，当bin的剩余空间小于100时不再继续匹配
                 min_seq_length = lengths_and_indices[-1][0] if lengths_and_indices else 0
@@ -105,7 +107,9 @@ class PretrainDataset(Dataset):
                     for c in range(length, max_length + 1):
                         if bins_by_capacity[c]:
                             bin_idx = bins_by_capacity[c].pop()
-                            bins[bin_idx].extend(tokens)
+                            
+                            start = bin_sums[bin_idx]
+                            bins[bin_idx][start:start+length] = tokens
                             bin_sums[bin_idx] += length
                             placed = True
                             
@@ -115,33 +119,33 @@ class PretrainDataset(Dataset):
                             break
                             
                     if not placed:
-                        # 新开一个 bin
-                        bins.append(tokens)
+                        # 新开一个 bin，直接用 numpy 数组
+                        new_bin = np.full(max_length, pad_token, dtype=np.uint32)
+                        new_bin[0:length] = tokens
+                        bins.append(new_bin)
                         bin_sums.append(length)
+                        
                         new_c = max_length - length
                         if new_c >= drop_threshold:
                             bins_by_capacity[new_c].append(len(bins) - 1)
                         
                 print(f"Packed {len(tokenized_dataset)} sequences into {len(bins)} bins.")
-                torch.save(bins, cache_path)
+                bins_np = np.stack(bins)
+                np.save(cache_path, bins_np)
                 print(f"Saved packed dataset to {cache_path}")
         
         if is_dist:
             dist.barrier()
             
         print(f"Loading packed dataset from {cache_path}")
-        self.samples = torch.load(cache_path)
+        self.samples = np.load(cache_path, mmap_mode='r')
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, index):
-        packed_ids = self.samples[index].copy() 
-        remaining_len = self.max_length - len(packed_ids)
-        if remaining_len > 0:
-            packed_ids.extend([self.tokenizer.pad_token_id] * remaining_len)
-            
-        input_ids = torch.tensor(packed_ids, dtype=torch.long)
+        packed_ids = self.samples[index]
+        input_ids = torch.tensor(packed_ids.astype(np.int64), dtype=torch.long)
         labels = input_ids.clone()
         labels[input_ids == self.tokenizer.pad_token_id] = -100
         return input_ids, labels
