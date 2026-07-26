@@ -85,33 +85,42 @@ class PretrainDataset(Dataset):
                 lengths_and_indices = [(length, i) for i, length in enumerate(tokenized_dataset['length'])]
                 lengths_and_indices.sort(key=lambda x: x[0], reverse=True)
                 
-                print("Packing sequences into bins...")
+                print("Packing sequences into bins (Bucketed Best-Fit)...")
                 from tqdm import tqdm
                 bins = [] 
                 bin_sums = [] 
-                active_bin_indices = []
                 
-                # 为极大提升打包速度，当bin的剩余空间小于100时直接移出活跃队列
+                # 为极大提升打包速度，当bin的剩余空间小于100时不再继续匹配
                 min_seq_length = lengths_and_indices[-1][0] if lengths_and_indices else 0
                 drop_threshold = max(100, min_seq_length)
+                
+                # 按剩余容量将 bin 分桶，实现 O(N) 极速匹配
+                bins_by_capacity = [[] for _ in range(max_length + 1)]
                 
                 for length, idx in tqdm(lengths_and_indices, desc="Packing sequences"):
                     tokens = tokenized_dataset[idx]['tokens']
                     placed = False
-                    for i in range(len(active_bin_indices)):
-                        active_idx = active_bin_indices[i]
-                        if bin_sums[active_idx] + length <= max_length:
-                            bins[active_idx].extend(tokens)
-                            bin_sums[active_idx] += length
+                    
+                    # 寻找能装下该长度的最佳 bin (容量从刚好等于 length 开始往上找)
+                    for c in range(length, max_length + 1):
+                        if bins_by_capacity[c]:
+                            bin_idx = bins_by_capacity[c].pop()
+                            bins[bin_idx].extend(tokens)
+                            bin_sums[bin_idx] += length
                             placed = True
-                            if max_length - bin_sums[active_idx] < drop_threshold:
-                                active_bin_indices.pop(i)
+                            
+                            new_c = c - length
+                            if new_c >= drop_threshold:
+                                bins_by_capacity[new_c].append(bin_idx)
                             break
+                            
                     if not placed:
+                        # 新开一个 bin
                         bins.append(tokens)
                         bin_sums.append(length)
-                        if max_length - length >= drop_threshold:
-                            active_bin_indices.append(len(bins) - 1)
+                        new_c = max_length - length
+                        if new_c >= drop_threshold:
+                            bins_by_capacity[new_c].append(len(bins) - 1)
                         
                 print(f"Packed {len(tokenized_dataset)} sequences into {len(bins)} bins.")
                 torch.save(bins, cache_path)

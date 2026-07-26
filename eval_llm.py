@@ -10,7 +10,10 @@ from trainer.trainer_utils import setup_seed, get_model_params
 warnings.filterwarnings('ignore')
 
 def init_model(args):
-    tokenizer = AutoTokenizer.from_pretrained(args.load_from)
+    tokenizer_path = args.load_from
+    if tokenizer_path == 'model' and getattr(args, 'model_type', 'minimind') == 'dsv4_mini':
+        tokenizer_path = 'model/tokenizer_dsv4m'
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
     if 'model' in args.load_from:
         if args.model_type == 'dsv4_mini':
             from model.model_dsv4_mini import DeepSeekV4MiniConfig, DeepSeekV4MiniForCausalLM

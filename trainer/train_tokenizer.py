@@ -4,9 +4,9 @@ import os
 import json
 from tokenizers import decoders, models, pre_tokenizers, trainers, Tokenizer
 
-DATA_PATH = '../dataset/sft_t2t_mini.jsonl'
+DATA_PATH = '../dataset/pretrain_t2t_mini.jsonl'
 TOKENIZER_DIR = '../model_learn_tokenizer/'
-VOCAB_SIZE = 6400
+VOCAB_SIZE = 32000
 SPECIAL_TOKENS_NUM = 36
 
 def get_texts(data_path):
@@ -15,9 +15,12 @@ def get_texts(data_path):
             if i >= 10000: break # 选10000行测试
             try:
                 data = json.loads(line)
-                contents = [item.get('content') for item in data.get('conversations', []) if item.get('content')]
-                if contents:
-                    yield "\n".join(contents)
+                # contents = [item.get('content') for item in data.get('conversations', []) if item.get('content')]
+                # if contents:
+                #     yield "\n".join(contents)
+                text = data.get('text', '')
+                if text:
+                    yield text
             except json.JSONDecodeError:
                 continue
 

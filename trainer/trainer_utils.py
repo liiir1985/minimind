@@ -118,6 +118,8 @@ def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoc
 
 
 def init_model(lm_config, from_weight='pretrain', tokenizer_path='../model', save_dir='../out', device='cuda', model_type='minimind'):
+    if model_type == 'dsv4_mini' and tokenizer_path == '../model':
+        tokenizer_path = '../model/tokenizer_dsv4m'
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
     if model_type == 'dsv4_mini':
         model = DeepSeekV4MiniForCausalLM(lm_config)
