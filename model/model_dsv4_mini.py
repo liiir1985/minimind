@@ -743,11 +743,19 @@ class Block(nn.Module):
         # extra iterations just add kernel-launch overhead in decode-bound cases.
         iters = self.hc_sinkhorn_iters if self.training else min(self.hc_sinkhorn_iters, 5)
         pre, post, comb = hc_split_sinkhorn(mixes, hc_scale.float(), hc_base.float(), self.hc_mult, iters, self.hc_eps)
-        y = torch.sum(pre.unsqueeze(-1) * x_flat_f.view(shape), dim=2)
+        # y[b,s,d] = Σ_m pre[b,s,m] * x[b,s,m,d]  — replaces broadcast-then-sum which
+        # materialized a [B,S,M,D] intermediate.
+        y = torch.einsum("bsm,bsmd->bsd", pre, x_flat_f.view(shape))
         return y.to(dtype), post, comb
 
     def hc_post(self, x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor):
-        y = post.unsqueeze(-1) * x.unsqueeze(-2) + torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)
+        # Original:
+        #   y = post.unsqueeze(-1) * x.unsqueeze(-2)                             # [B,S,M,D]
+        #     + torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)    # sums over "input" hc dim
+        # The second term materialized a [B,S,M,M,D] intermediate. Both terms rewritten as einsum:
+        #   term1[b,s,m,d] = post[b,s,m] * x[b,s,d]                     ("bsm,bsd->bsmd")
+        #   term2[b,s,m,d] = Σ_n comb[b,s,n,m] * residual[b,s,n,d]     ("bsnm,bsnd->bsmd")
+        y = torch.einsum("bsm,bsd->bsmd", post, x) + torch.einsum("bsnm,bsnd->bsmd", comb, residual)
         return y.type_as(x)
 
     def forward(self, x: torch.Tensor, start_pos: int, input_ids: Optional[torch.Tensor]) -> torch.Tensor:
@@ -794,7 +802,8 @@ class ParallelHead(nn.Module):
         rsqrt = torch.rsqrt(x_flat_f.square().mean(-1, keepdim=True) + self.norm_eps)
         mixes = mixes.float() * rsqrt
         pre = torch.sigmoid(mixes * hc_scale[0].float() + hc_base.float()) + self.hc_eps
-        y = torch.sum(pre.unsqueeze(-1) * x_flat_f.view(shape), dim=2)
+        # y[b,s,d] = Σ_m pre[b,s,m] * x[b,s,m,d]  — same optimization as hc_pre.
+        y = torch.einsum("bsm,bsmd->bsd", pre, x_flat_f.view(shape))
         return y.to(dtype)
 
 
