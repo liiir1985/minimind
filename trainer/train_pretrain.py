@@ -129,6 +129,7 @@ if __name__ == "__main__":
             num_routed_experts=16 if is_micro else 32,
             hc_mult=2 if is_micro else 4,
             n_mtp_layers=0 if is_micro else 1,
+            max_seq_len=args.max_seq_len,
         )
     else:
         lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe))

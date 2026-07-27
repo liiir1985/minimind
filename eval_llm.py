@@ -18,6 +18,9 @@ def init_model(args):
         if args.model_type == 'dsv4_mini':
             from model.model_dsv4_mini import DeepSeekV4MiniConfig, DeepSeekV4MiniForCausalLM
             is_micro = args.hidden_size < 768
+            # max_seq_len is the trained context length. When YaRN is enabled,
+            # the effective context extends to max_seq_len * rope_factor.
+            effective_max = int(args.max_seq_len * args.rope_factor) if args.inference_rope_scaling else args.max_seq_len
             lm_config = DeepSeekV4MiniConfig(
                 hidden_size=args.hidden_size, 
                 num_hidden_layers=args.num_hidden_layers,
@@ -28,6 +31,10 @@ def init_model(args):
                 num_routed_experts=16 if is_micro else 32,
                 hc_mult=2 if is_micro else 4,
                 n_mtp_layers=0 if is_micro else 1,
+                max_seq_len=effective_max,
+                inference_rope_scaling=args.inference_rope_scaling,
+                rope_factor=args.rope_factor,
+                original_seq_len=args.max_seq_len,
             )
             model = DeepSeekV4MiniForCausalLM(lm_config)
             moe_suffix = ''
@@ -58,7 +65,9 @@ def main():
     parser.add_argument('--hidden_size', default=768, type=int, help="隐藏层维度")
     parser.add_argument('--num_hidden_layers', default=8, type=int, help="隐藏层数量")
     parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
-    parser.add_argument('--inference_rope_scaling', default=False, action='store_true', help="启用RoPE位置编码外推（4倍，仅解决位置编码问题）")
+    parser.add_argument('--inference_rope_scaling', default=False, action='store_true', help="启用RoPE位置编码外推（YaRN，训练长度→更长）")
+    parser.add_argument('--max_seq_len', default=2048, type=int, help="dsv4_mini专用：训练时的最大上下文长度（YaRN外推起点，开启外推后实际最大长度=max_seq_len*rope_factor）")
+    parser.add_argument('--rope_factor', default=16.0, type=float, help="dsv4_mini专用：YaRN外推倍数")
     parser.add_argument('--max_new_tokens', default=8192, type=int, help="最大生成长度（注意：并非模型实际长文本能力）")
     parser.add_argument('--temperature', default=0.85, type=float, help="生成温度，控制随机性（0-1，越大越随机）")
     parser.add_argument('--top_p', default=0.95, type=float, help="nucleus采样阈值（0-1）")

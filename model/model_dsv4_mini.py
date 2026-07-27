@@ -1,11 +1,12 @@
-import math
 from dataclasses import dataclass
 from typing import Tuple, Optional, Literal, List
 from functools import lru_cache
+import math
 
 import torch
 from torch import nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from transformers import PretrainedConfig, PreTrainedModel, GenerationMixin
 
 
@@ -23,15 +24,16 @@ def sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale):
     """
     bsz, seqlen, n_heads, head_dim = q.shape
     topk = topk_idxs.shape[2]
-    
-    # Gather KV
-    topk_idxs_exp = topk_idxs.unsqueeze(-1).expand(-1, -1, -1, head_dim).long()
-    valid_mask = topk_idxs_exp >= 0
-    idx_clamped = topk_idxs_exp.clamp(min=0)
-    
-    kv_expanded = kv.unsqueeze(1).expand(-1, seqlen, -1, -1)
-    kv_selected = torch.gather(kv_expanded, 2, idx_clamped) # [bsz, seqlen, topk, head_dim]
-    kv_selected = kv_selected * valid_mask.type_as(kv_selected)
+    cache_len = kv.size(1)
+
+    # Gather KV via flat index_select — avoids the [bsz, seqlen, cache_len, head_dim]
+    # intermediate that expand+gather would materialize.
+    valid_mask = topk_idxs >= 0                                          # [bsz, seqlen, topk]
+    idx_clamped = topk_idxs.clamp(min=0).long()                          # [bsz, seqlen, topk]
+    batch_offset = (torch.arange(bsz, device=kv.device) * cache_len).view(bsz, 1, 1)
+    flat_idx = (idx_clamped + batch_offset).view(-1)                     # [bsz*seqlen*topk]
+    kv_selected = kv.reshape(-1, head_dim).index_select(0, flat_idx).view(bsz, seqlen, topk, head_dim)
+    kv_selected = kv_selected * valid_mask.unsqueeze(-1).type_as(kv_selected)
     
     # Q * K^T
     q_trans = q.transpose(1, 2).unsqueeze(3) # [bsz, n_heads, seqlen, 1, head_dim]
@@ -116,6 +118,12 @@ class DeepSeekV4MiniConfig(PretrainedConfig):
         n_hash_layers=0,
         n_mtp_layers=1,
         max_seq_len=2000,
+        # YaRN inference-time RoPE extrapolation (disabled by default)
+        inference_rope_scaling=False,
+        rope_factor=16.0,
+        original_seq_len=2048,
+        beta_fast=32,
+        beta_slow=1,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -150,6 +158,11 @@ class DeepSeekV4MiniConfig(PretrainedConfig):
         self.n_hash_layers = n_hash_layers
         self.n_mtp_layers = n_mtp_layers
         self.max_seq_len = max_seq_len
+        self.inference_rope_scaling = inference_rope_scaling
+        self.rope_factor = rope_factor
+        self.original_seq_len = original_seq_len
+        self.beta_fast = beta_fast
+        self.beta_slow = beta_slow
         super().__init__(**kwargs)
 
 
@@ -168,8 +181,31 @@ class RMSNorm(nn.Module):
 
 
 @lru_cache(2)
-def precompute_freqs_cis(dim, seqlen, base) -> torch.Tensor:
+def precompute_freqs_cis(dim, seqlen, base, original_seq_len=0, factor=1.0, beta_fast=32, beta_slow=1) -> torch.Tensor:
+    """Precompute complex RoPE frequencies. When original_seq_len > 0, applies YaRN scaling
+    to extend RoPE beyond the trained context, with a smooth linear ramp between
+    beta_fast (high-freq, kept as-is) and beta_slow (low-freq, interpolated by 1/factor)."""
+
+    def find_correction_dim(num_rotations, dim, base, max_seq_len):
+        return dim * math.log(max_seq_len / (num_rotations * 2 * math.pi)) / (2 * math.log(base))
+
+    def find_correction_range(low_rot, high_rot, dim, base, max_seq_len):
+        low = math.floor(find_correction_dim(low_rot, dim, base, max_seq_len))
+        high = math.ceil(find_correction_dim(high_rot, dim, base, max_seq_len))
+        return max(low, 0), min(high, dim - 1)
+
+    def linear_ramp_factor(low, high, dim):
+        if low == high:
+            high += 0.001
+        linear_func = (torch.arange(dim, dtype=torch.float32) - low) / (high - low)
+        return torch.clamp(linear_func, 0, 1)
+
     freqs = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+    if original_seq_len > 0 and factor > 1.0:
+        low, high = find_correction_range(beta_fast, beta_slow, dim, base, original_seq_len)
+        smooth = 1 - linear_ramp_factor(low, high, dim // 2)
+        freqs = freqs / factor * (1 - smooth) + freqs * smooth
+
     t = torch.arange(seqlen)
     freqs = torch.outer(t, freqs)
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
@@ -266,12 +302,15 @@ class Compressor(nn.Module):
             remainder = seqlen % ratio
             cutoff = seqlen - remainder
             offset = ratio if overlap else 0
-            if overlap and cutoff >= ratio:
-                self.kv_state[:bsz, :ratio] = kv[:, cutoff-ratio : cutoff]
-                self.score_state[:bsz, :ratio] = score[:, cutoff-ratio : cutoff] + self.ape
+            if not self.training:
+                if overlap and cutoff >= ratio:
+                    self.kv_state[:bsz, :ratio] = kv[:, cutoff-ratio : cutoff].detach()
+                    self.score_state[:bsz, :ratio] = (score[:, cutoff-ratio : cutoff] + self.ape).detach()
+                if remainder > 0:
+                    self.kv_state[:bsz, offset : offset+remainder] = kv[:, cutoff:].detach()
+                    self.score_state[:bsz, offset : offset+remainder] = (score[:, cutoff:] + self.ape[:remainder]).detach()
             if remainder > 0:
-                kv, self.kv_state[:bsz, offset : offset+remainder] = kv.split([cutoff, remainder], dim=1)
-                self.score_state[:bsz, offset : offset+remainder] = score[:, cutoff:] + self.ape[:remainder]
+                kv = kv[:, :cutoff]
                 score = score[:, :cutoff]
             kv = kv.unflatten(1, (-1, ratio))
             score = score.unflatten(1, (-1, ratio)) + self.ape
@@ -283,17 +322,17 @@ class Compressor(nn.Module):
             should_compress = (start_pos + 1) % self.compress_ratio == 0
             score += self.ape[start_pos % ratio]
             if overlap:
-                self.kv_state[:bsz, ratio + start_pos % ratio] = kv.squeeze(1)
-                self.score_state[:bsz, ratio + start_pos % ratio] = score.squeeze(1)
+                self.kv_state[:bsz, ratio + start_pos % ratio] = kv.squeeze(1).detach()
+                self.score_state[:bsz, ratio + start_pos % ratio] = score.squeeze(1).detach()
                 if should_compress:
                     kv_state = torch.cat([self.kv_state[:bsz, :ratio, :d], self.kv_state[:bsz, ratio:, d:]], dim=1)
                     score_state = torch.cat([self.score_state[:bsz, :ratio, :d], self.score_state[:bsz, ratio:, d:]], dim=1)
                     kv = (kv_state * score_state.softmax(dim=1)).sum(dim=1, keepdim=True)
-                    self.kv_state[:bsz, :ratio] = self.kv_state[:bsz, ratio:]
-                    self.score_state[:bsz, :ratio] = self.score_state[:bsz, ratio:]
+                    self.kv_state[:bsz, :ratio] = self.kv_state[:bsz, ratio:].detach()
+                    self.score_state[:bsz, :ratio] = self.score_state[:bsz, ratio:].detach()
             else:
-                self.kv_state[:bsz, start_pos % ratio] = kv.squeeze(1)
-                self.score_state[:bsz, start_pos % ratio] = score.squeeze(1)
+                self.kv_state[:bsz, start_pos % ratio] = kv.squeeze(1).detach()
+                self.score_state[:bsz, start_pos % ratio] = score.squeeze(1).detach()
                 if should_compress:
                     kv = (self.kv_state[:bsz] * self.score_state[:bsz].softmax(dim=1)).sum(dim=1, keepdim=True)
         if not should_compress:
@@ -306,10 +345,11 @@ class Compressor(nn.Module):
         
         apply_rotary_emb(kv[..., -rd:], freqs_cis)
         
-        if start_pos == 0:
-            self.kv_cache[:bsz, :seqlen // ratio] = kv
-        else:
-            self.kv_cache[:bsz, start_pos // ratio] = kv.squeeze(1)
+        if not self.training:
+            if start_pos == 0:
+                self.kv_cache[:bsz, :seqlen // ratio] = kv.detach()
+            else:
+                self.kv_cache[:bsz, start_pos // ratio] = kv.squeeze(1).detach()
         return kv
 
 
@@ -351,10 +391,15 @@ class Indexer(torch.nn.Module):
         q = q.unflatten(-1, (self.n_heads, self.head_dim))
         apply_rotary_emb(q[..., -rd:], freqs_cis)
         
-        self.compressor(x, start_pos)
+        kv_compress = self.compressor(x, start_pos)
         weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads ** -0.5)
         
-        index_score = torch.einsum("bshd,btd->bsht", q, self.kv_cache[:bsz, :end_pos // ratio])
+        if self.training and start_pos == 0 and kv_compress is not None:
+            # Take kv directly from Compressor return to keep gradients flowing.
+            index_kv = kv_compress
+        else:
+            index_kv = self.kv_cache[:bsz, :end_pos // ratio]
+        index_score = torch.einsum("bshd,btd->bsht", q, index_kv)
         index_score = (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
         
         if start_pos == 0:
@@ -408,7 +453,10 @@ class Attention(nn.Module):
         kv_cache_size = self.window_size + (config.max_seq_len // self.compress_ratio if self.compress_ratio else 0)
         self.register_buffer("kv_cache", torch.zeros(1, kv_cache_size, self.head_dim), persistent=False)
         
-        freqs_cis = precompute_freqs_cis(self.rope_head_dim, config.max_seq_len, config.rope_theta)
+        yarn_orig = config.original_seq_len if config.inference_rope_scaling else 0
+        yarn_factor = config.rope_factor if config.inference_rope_scaling else 1.0
+        freqs_cis = precompute_freqs_cis(self.rope_head_dim, config.max_seq_len, config.rope_theta,
+                                          yarn_orig, yarn_factor, config.beta_fast, config.beta_slow)
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
 
     def forward(self, x: torch.Tensor, start_pos: int):
@@ -452,11 +500,13 @@ class Attention(nn.Module):
         topk_idxs = topk_idxs.int()
 
         if start_pos == 0:
-            if seqlen <= win:
-                self.kv_cache[:bsz, :seqlen] = kv
-            else:
-                cutoff = seqlen % win
-                self.kv_cache[:bsz, cutoff: win], self.kv_cache[:bsz, :cutoff] = kv[:, -win:].split([win - cutoff, cutoff], dim=1)
+            if not self.training:
+                if seqlen <= win:
+                    self.kv_cache[:bsz, :seqlen] = kv.detach()
+                else:
+                    cutoff = seqlen % win
+                    kv_win = kv[:, -win:].detach()
+                    self.kv_cache[:bsz, cutoff: win], self.kv_cache[:bsz, :cutoff] = kv_win.split([win - cutoff, cutoff], dim=1)
             if self.compress_ratio:
                 kv_compress = self.compressor(x, start_pos)
                 if kv_compress is not None:
@@ -464,7 +514,8 @@ class Attention(nn.Module):
             
             o = sparse_attn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
         else:
-            self.kv_cache[:bsz, start_pos % win] = kv.squeeze(1)
+            if not self.training:
+                self.kv_cache[:bsz, start_pos % win] = kv.squeeze(1).detach()
             if self.compress_ratio:
                 self.compressor(x, start_pos)
             o = sparse_attn(q, self.kv_cache[:bsz], self.attn_sink, topk_idxs, self.softmax_scale)
@@ -530,8 +581,8 @@ class Expert(nn.Module):
 
     def forward(self, x: torch.Tensor, weights: Optional[torch.Tensor] = None) -> torch.Tensor:
         dtype = x.dtype
-        gate = self.w1(x).float()
-        up = self.w3(x).float()
+        gate = self.w1(x)
+        up = self.w3(x)
         if self.swiglu_limit > 0:
             up = torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit)
             gate = torch.clamp(gate, max=self.swiglu_limit)
@@ -560,14 +611,12 @@ class MoE(nn.Module):
         weights, indices = self.gate(x_flat, input_ids.flatten())
         
         y = torch.zeros_like(x_flat, dtype=torch.float32)
-        
-        counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts).tolist()
+
         for i in range(self.n_routed_experts):
-            if counts[i] == 0:
-                continue
-            expert = self.experts[i]
             idx, top = torch.where(indices == i)
-            y[idx] += expert(x_flat[idx], weights[idx, top, None])
+            if idx.numel() == 0:
+                continue
+            y[idx] += self.experts[i](x_flat[idx], weights[idx, top, None])
             
         y += self.shared_experts(x_flat)
         return y.type_as(x).view(shape)
@@ -638,15 +687,16 @@ class ParallelHead(nn.Module):
         self.dim = dim
         self.norm_eps = norm_eps
         self.hc_eps = hc_eps
-        self.weight = nn.Parameter(torch.empty(vocab_size, dim, dtype=torch.float32))
+        self.weight = nn.Parameter(torch.empty(vocab_size, dim, dtype=torch.bfloat16))
         nn.init.normal_(self.weight, std=0.02)
 
     def get_logits(self, x):
-        return F.linear(x[:, -1].float(), self.weight.float())
+        return F.linear(x[:, -1].to(self.weight.dtype), self.weight).float()
 
     def forward(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor, norm: RMSNorm):
         x = self.hc_head(x, hc_fn, hc_scale, hc_base)
-        logits = F.linear(norm(x).float(), self.weight.float())
+        # bf16 mm for speed; upcast to fp32 for numerically-stable loss/log_softmax downstream
+        logits = F.linear(norm(x).to(self.weight.dtype), self.weight).float()
         return logits
 
     def hc_head(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor):
@@ -767,7 +817,10 @@ class DeepSeekV4MiniForCausalLM(PreTrainedModel, GenerationMixin):
         h = h.unsqueeze(2).expand(-1, -1, self.hc_mult, -1).clone()
         
         for layer in self.layers:
-            h = layer(h, start_pos, input_ids)
+            if self.training:
+                h = checkpoint(layer, h, start_pos, input_ids, use_reentrant=True)
+            else:
+                h = layer(h, start_pos, input_ids)
             
         logits = self.head(h, self.hc_head_fn, self.hc_head_scale, self.hc_head_base, self.norm)
         
