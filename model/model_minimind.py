@@ -242,6 +242,10 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
         if self.config.tie_word_embeddings: self.model.embed_tokens.weight = self.lm_head.weight
         self.post_init()
 
+    def to_inference_dtype(self, dtype=torch.float16):
+        """MiniMind is fully bf16/fp16-safe (SDPA + standard RoPE + RMSNorm handles its own upcast)."""
+        return self.to(dtype)
+
     def forward(self, input_ids, attention_mask=None, past_key_values=None, use_cache=False, logits_to_keep=0, labels=None, **kwargs):
         hidden_states, past_key_values, aux_loss = self.model(input_ids, attention_mask, past_key_values, use_cache, **kwargs)
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep

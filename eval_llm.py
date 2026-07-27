@@ -28,9 +28,9 @@ def init_model(args):
                 moe_inter_dim=args.hidden_size,
                 q_lora_rank=(args.hidden_size // 3 // 16 * 16) if is_micro else 256,
                 o_lora_rank=(args.hidden_size // 3 // 16 * 16) if is_micro else 256,
-                num_routed_experts=16 if is_micro else 32,
+                num_routed_experts=8 if is_micro else 16,
                 hc_mult=2 if is_micro else 4,
-                n_mtp_layers=0 if is_micro else 1,
+                n_mtp_layers=0,
                 max_seq_len=effective_max,
                 inference_rope_scaling=args.inference_rope_scaling,
                 rope_factor=args.rope_factor,
@@ -54,7 +54,13 @@ def init_model(args):
     else:
         model = AutoModelForCausalLM.from_pretrained(args.load_from, trust_remote_code=True)
     get_model_params(model, model.config)
-    return model.half().eval().to(args.device), tokenizer
+    model = model.to(args.device).eval()
+    # Each model type knows its own inference dtype recipe internally.
+    if hasattr(model, 'to_inference_dtype'):
+        model = model.to_inference_dtype()
+    else:
+        model = model.half()
+    return model, tokenizer
 
 def main():
     parser = argparse.ArgumentParser(description="MiniMind模型推理与对话")
@@ -68,7 +74,7 @@ def main():
     parser.add_argument('--inference_rope_scaling', default=False, action='store_true', help="启用RoPE位置编码外推（YaRN，训练长度→更长）")
     parser.add_argument('--max_seq_len', default=2048, type=int, help="dsv4_mini专用：训练时的最大上下文长度（YaRN外推起点，开启外推后实际最大长度=max_seq_len*rope_factor）")
     parser.add_argument('--rope_factor', default=16.0, type=float, help="dsv4_mini专用：YaRN外推倍数")
-    parser.add_argument('--max_new_tokens', default=8192, type=int, help="最大生成长度（注意：并非模型实际长文本能力）")
+    parser.add_argument('--max_new_tokens', default=2000, type=int, help="最大生成长度（注意：并非模型实际长文本能力）")
     parser.add_argument('--temperature', default=0.85, type=float, help="生成温度，控制随机性（0-1，越大越随机）")
     parser.add_argument('--top_p', default=0.95, type=float, help="nucleus采样阈值（0-1）")
     parser.add_argument('--open_thinking', default=0, type=int, help="是否开启自适应思考（0=否，1=是）")

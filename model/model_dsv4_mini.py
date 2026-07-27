@@ -116,7 +116,7 @@ class DeepSeekV4MiniConfig(PretrainedConfig):
         hc_sinkhorn_iters=20,
         hc_eps=1e-6,
         n_hash_layers=0,
-        n_mtp_layers=1,
+        n_mtp_layers=0,
         max_seq_len=2000,
         # MoE load-balancing auxiliary loss coefficient (0 to disable)
         router_aux_loss_coef=1e-3,
@@ -160,6 +160,7 @@ class DeepSeekV4MiniConfig(PretrainedConfig):
         self.n_hash_layers = n_hash_layers
         self.n_mtp_layers = n_mtp_layers
         self.max_seq_len = max_seq_len
+        self.router_aux_loss_coef = router_aux_loss_coef
         self.inference_rope_scaling = inference_rope_scaling
         self.rope_factor = rope_factor
         self.original_seq_len = original_seq_len
@@ -209,23 +210,58 @@ def precompute_freqs_cis(dim, seqlen, base, original_seq_len=0, factor=1.0, beta
         freqs = freqs / factor * (1 - smooth) + freqs * smooth
 
     t = torch.arange(seqlen)
-    freqs = torch.outer(t, freqs)
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
+    freqs = torch.outer(t, freqs)                       # [seqlen, dim/2]
+    # Real-valued RoPE table: stack cos and sin along a new dim.
+    # Shape: [seqlen, dim/2, 2]  where [..., 0]=cos, [..., 1]=sin.
+    # Kept in fp32 for numerical stability across YaRN scaling.
+    freqs_cis = torch.stack([freqs.cos(), freqs.sin()], dim=-1)
     return freqs_cis
 
 
 def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = False) -> torch.Tensor:
-    y = x.clone() if not x.is_contiguous() else x
-    x_c = torch.view_as_complex(x.float().unflatten(-1, (-1, 2)))
+    """
+    Real-valued RoPE with adjacent-pair rotation (mathematically equivalent to the
+    complex-valued formulation but ONNX/RKNN-friendly — no complex ops).
+
+    x:         [..., seqlen, D]       or  [..., seqlen, H, D]   (D == rope_head_dim, even)
+    freqs_cis: [seqlen, D/2, 2]                       where [..., 0]=cos, [..., 1]=sin
+               (caller must already slice by start_pos:start_pos+seqlen)
+    inverse:   if True, apply the inverse rotation (uses -sin).
+    Modifies x in-place and returns it.
+    """
+    orig_dtype = x.dtype
+    seqlen, d_half = freqs_cis.size(0), freqs_cis.size(1)
+
+    # freqs_cis: [seqlen, D/2, 2] → cos/sin split
+    cos = freqs_cis[..., 0]                     # [seqlen, D/2]
+    sin = freqs_cis[..., 1]                     # [seqlen, D/2]
     if inverse:
-        freqs_cis = freqs_cis.conj()
-    if x_c.ndim == 3:
-        freqs_cis = freqs_cis.view(1, x_c.size(1), x_c.size(-1))
+        sin = -sin
+
+    # Broadcast shape:
+    #   x.ndim == 3 (Compressor path): x is [bsz, seqlen, D]      → cos/sin: [1, seqlen, D/2]
+    #   x.ndim == 4 (Attention path):  x is [bsz, seqlen, H, D]   → cos/sin: [1, seqlen, 1, D/2]
+    if x.ndim == 3:
+        cos = cos.view(1, seqlen, d_half)
+        sin = sin.view(1, seqlen, d_half)
     else:
-        freqs_cis = freqs_cis.view(1, x_c.size(1), 1, x_c.size(-1))
-    x_out = torch.view_as_real(x_c * freqs_cis).flatten(-2)
-    y.copy_(x_out)
-    return y
+        cos = cos.view(1, seqlen, 1, d_half)
+        sin = sin.view(1, seqlen, 1, d_half)
+
+    # Pair-wise rotation: [..., D] → [..., D/2, 2]
+    x_pair = x.float().unflatten(-1, (d_half, 2))
+    x_even = x_pair[..., 0]                      # d_0, d_2, d_4, ...
+    x_odd  = x_pair[..., 1]                      # d_1, d_3, d_5, ...
+
+    new_even = x_even * cos - x_odd  * sin
+    new_odd  = x_even * sin + x_odd  * cos
+
+    # Interleave back: [..., D/2, 2] → [..., D]
+    out = torch.stack([new_even, new_odd], dim=-1).flatten(-2).to(orig_dtype)
+    # Preserve the original in-place-write semantics that callers rely on
+    # (they pass x[..., -rd:] and expect the slice to be modified).
+    x.copy_(out)
+    return x
 
 
 @lru_cache(2)
@@ -583,7 +619,7 @@ class Gate(nn.Module):
         if self.score_func != "softmax":
             weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-6)
         weights = weights * self.route_scale
-        return weights, indices
+        return weights, indices, original_scores
 
 
 class Expert(nn.Module):
@@ -614,18 +650,31 @@ class MoE(nn.Module):
         self.dim = config.hidden_size
         self.n_routed_experts = config.num_routed_experts
         self.n_activated_experts = config.num_activated_experts
+        self.router_aux_loss_coef = getattr(config, 'router_aux_loss_coef', 0.0)
         
         self.gate = Gate(layer_id, config)
         self.experts = nn.ModuleList([Expert(config.hidden_size, config.moe_inter_dim, swiglu_limit=config.swiglu_limit) for _ in range(self.n_routed_experts)])
         
         self.shared_experts = Expert(config.hidden_size, config.moe_inter_dim, swiglu_limit=config.swiglu_limit)
+        # buffer for the load-balancing loss; read by top-level model and reset each forward.
+        self.aux_loss = None
 
     def forward(self, x: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
         shape = x.size()
         x_flat = x.view(-1, self.dim)
-        weights, indices = self.gate(x_flat, input_ids.flatten())
+        weights, indices, original_scores = self.gate(x_flat, input_ids.flatten())
         
-        # Fast path for single-token decode: skip the 32-expert loop entirely.
+        # Load-balancing aux loss (only during training): encourages uniform expert usage.
+        # load[i] = fraction of tokens routed to expert i; scores_mean[i] = mean gate score for expert i.
+        # Loss is minimized when both distributions are uniform (dot product minimized).
+        if self.training and self.router_aux_loss_coef > 0 and not self.gate.hash:
+            load = F.one_hot(indices.view(-1), self.n_routed_experts).float().mean(dim=0)
+            scores_mean = original_scores.mean(dim=0)
+            self.aux_loss = (load * scores_mean).sum() * self.n_routed_experts * self.router_aux_loss_coef
+        else:
+            self.aux_loss = None
+        
+        # Fast path for single-token decode: skip the routed-expert loop entirely.
         # x_flat has shape [N, dim] where N = bsz * seqlen. In decode, N == bsz (usually 1).
         # With num_activated_experts=1, we can just do one direct expert call per token.
         if not self.training and x_flat.size(0) <= 4 and self.n_activated_experts == 1:
@@ -838,6 +887,27 @@ class DeepSeekV4MiniForCausalLM(PreTrainedModel, GenerationMixin):
             # Only init 1D/2D general parameters. Specific ones like scaling should be initialized properly.
             torch.nn.init.normal_(module, mean=0.0, std=0.02)
 
+    # Parameter/buffer name substrings that must remain fp32 even after `to_inference_dtype()`
+    # (softmax / rsqrt / Sinkhorn / state accumulation — all numerically sensitive).
+    _FP32_INFERENCE_KEYS = (
+        'norm.weight', 'hc_scale', 'hc_base',
+        'attn_sink', 'ape',
+        'gate.weight', 'gate.bias',
+        'kv_state', 'score_state',
+    )
+
+    def to_inference_dtype(self, dtype=torch.bfloat16):
+        """Cast the model to `dtype` (default bf16) for fast inference, but preserve
+        the fp32 dtype of parameters/buffers that need numerical stability. Idempotent."""
+        self.to(dtype)
+        for name, param in self.named_parameters():
+            if any(k in name for k in self._FP32_INFERENCE_KEYS):
+                param.data = param.data.float()
+        for name, buf in self.named_buffers():
+            if any(k in name for k in self._FP32_INFERENCE_KEYS):
+                buf.data = buf.data.float()
+        return self
+
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -864,9 +934,12 @@ class DeepSeekV4MiniForCausalLM(PreTrainedModel, GenerationMixin):
             
         logits = self.head(h, self.hc_head_fn, self.hc_head_scale, self.hc_head_base, self.norm)
         
-        # MTP loss can be computed here if labels are provided in a specific format,
-        # but for compatibility with standard training loops, we return 0 aux_loss.
+        # Sum load-balancing aux loss across all MoE layers (only set during training).
         aux_loss = torch.tensor(0.0, device=h.device)
+        for layer in self.layers:
+            ffn = getattr(layer, 'ffn', None)
+            if ffn is not None and getattr(ffn, 'aux_loss', None) is not None:
+                aux_loss = aux_loss + ffn.aux_loss
         
         loss = None
         if labels is not None:

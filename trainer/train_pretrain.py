@@ -128,7 +128,7 @@ if __name__ == "__main__":
             o_lora_rank=(args.hidden_size // 3 // 16 * 16) if is_micro else 256,
             num_routed_experts=8 if is_micro else 16,
             hc_mult=2 if is_micro else 4,
-            n_mtp_layers=0 if is_micro else 1,
+            n_mtp_layers=0,
             max_seq_len=args.max_seq_len,
         )
     else:
