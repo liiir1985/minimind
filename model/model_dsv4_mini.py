@@ -113,7 +113,7 @@ class DeepSeekV4MiniConfig(PretrainedConfig):
         index_head_dim=128,
         index_topk=512,
         hc_mult=4,
-        hc_sinkhorn_iters=20,
+        hc_sinkhorn_iters=10,
         hc_eps=1e-6,
         n_hash_layers=0,
         n_mtp_layers=0,
