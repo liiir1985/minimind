@@ -126,7 +126,7 @@ if __name__ == "__main__":
             moe_inter_dim=args.hidden_size,
             q_lora_rank=(args.hidden_size // 3 // 16 * 16) if is_micro else 256,
             o_lora_rank=(args.hidden_size // 3 // 16 * 16) if is_micro else 256,
-            num_routed_experts=16 if is_micro else 32,
+            num_routed_experts=8 if is_micro else 16,
             hc_mult=2 if is_micro else 4,
             n_mtp_layers=0 if is_micro else 1,
             max_seq_len=args.max_seq_len,

@@ -41,14 +41,14 @@ def sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale):
     
     scores = (q_trans @ k_trans.transpose(-2, -1)) * softmax_scale # [bsz, n_heads, seqlen, 1, topk]
     
-    valid_mask_attn = (topk_idxs >= 0).view(bsz, 1, seqlen, 1, topk)
+    valid_mask_attn = valid_mask.view(bsz, 1, seqlen, 1, topk)
     scores = scores.masked_fill(~valid_mask_attn, float('-inf'))
     
-    # Sink
+    # Sink (attn_sink is fp32; upcast scores briefly for stable softmax, then cast back)
     sink_score = attn_sink.view(1, n_heads, 1, 1, 1).expand(bsz, -1, seqlen, 1, 1)
-    scores = torch.cat([scores, sink_score], dim=-1)
+    scores = torch.cat([scores.float(), sink_score.float()], dim=-1)
     
-    probs = F.softmax(scores, dim=-1)
+    probs = F.softmax(scores, dim=-1).to(kv.dtype)
     
     # V
     v_sink = torch.zeros(bsz, 1, seqlen, 1, head_dim, device=k_trans.device, dtype=k_trans.dtype)
@@ -99,7 +99,7 @@ class DeepSeekV4MiniConfig(PretrainedConfig):
         o_lora_rank=256,
         o_groups=4,
         moe_inter_dim=768,
-        num_routed_experts=32,
+        num_routed_experts=16,
         num_shared_experts=1,
         num_activated_experts=1,
         score_func="sqrtsoftplus",
@@ -107,7 +107,7 @@ class DeepSeekV4MiniConfig(PretrainedConfig):
         swiglu_limit=0.0,
         norm_eps=1e-6,
         window_size=128,
-        compress_ratios=(0,0,0,0,0,0,0,0),
+        compress_ratios=(0, 0, 4, 128, 4, 128, 4, 0),
         rope_theta=10000.0,
         index_n_heads=8,
         index_head_dim=128,
@@ -118,6 +118,8 @@ class DeepSeekV4MiniConfig(PretrainedConfig):
         n_hash_layers=0,
         n_mtp_layers=1,
         max_seq_len=2000,
+        # MoE load-balancing auxiliary loss coefficient (0 to disable)
+        router_aux_loss_coef=1e-3,
         # YaRN inference-time RoPE extrapolation (disabled by default)
         inference_rope_scaling=False,
         rope_factor=16.0,
@@ -294,9 +296,16 @@ class Compressor(nn.Module):
 
         ratio, overlap, d, rd = self.compress_ratio, self.overlap, self.head_dim, self.rope_head_dim
         dtype = x.dtype
-        x = x.float()
-        kv = self.wkv(x)
-        score = self.wgate(x)
+        # mm in x's dtype (typically bf16) for tensor-core speed; cast weights if needed.
+        w_kv, w_gate = self.wkv.weight, self.wgate.weight
+        if w_kv.dtype != x.dtype:
+            w_kv = w_kv.to(x.dtype)
+            w_gate = w_gate.to(x.dtype)
+        kv = F.linear(x, w_kv)
+        score = F.linear(x, w_gate)
+        # Upcast to fp32 for softmax / state accumulation / ape addition.
+        kv = kv.float()
+        score = score.float()
         if start_pos == 0:
             should_compress = seqlen >= ratio
             remainder = seqlen % ratio
@@ -616,6 +625,18 @@ class MoE(nn.Module):
         x_flat = x.view(-1, self.dim)
         weights, indices = self.gate(x_flat, input_ids.flatten())
         
+        # Fast path for single-token decode: skip the 32-expert loop entirely.
+        # x_flat has shape [N, dim] where N = bsz * seqlen. In decode, N == bsz (usually 1).
+        # With num_activated_experts=1, we can just do one direct expert call per token.
+        if not self.training and x_flat.size(0) <= 4 and self.n_activated_experts == 1:
+            y_bf = torch.zeros_like(x_flat)
+            # indices: [N, 1], weights: [N, 1]
+            for token_i in range(x_flat.size(0)):
+                exp_id = int(indices[token_i, 0].item())
+                y_bf[token_i] = self.experts[exp_id](x_flat[token_i:token_i+1], weights[token_i:token_i+1, 0:1]).squeeze(0)
+            y_bf = y_bf + self.shared_experts(x_flat)
+            return y_bf.view(shape)
+        
         y = torch.zeros_like(x_flat, dtype=torch.float32)
 
         for i in range(self.n_routed_experts):
@@ -660,11 +681,20 @@ class Block(nn.Module):
 
     def hc_pre(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor):
         shape, dtype = x.size(), x.dtype
-        x_flat = x.flatten(2).float()
-        rsqrt = torch.rsqrt(x_flat.square().mean(-1, keepdim=True) + self.norm_eps)
-        mixes = F.linear(x_flat, hc_fn.float()) * rsqrt
-        pre, post, comb = hc_split_sinkhorn(mixes, hc_scale.float(), hc_base.float(), self.hc_mult, self.hc_sinkhorn_iters, self.hc_eps)
-        y = torch.sum(pre.unsqueeze(-1) * x_flat.view(shape), dim=2)
+        x_flat = x.flatten(2)
+        # mm: 若 hc_fn 与 x_flat 同 dtype (推理: 皆 bf16), 走 tensor core; 否则 cast.
+        if hc_fn.dtype != x_flat.dtype:
+            hc_fn = hc_fn.to(x_flat.dtype)
+        mixes = F.linear(x_flat, hc_fn)
+        # rsqrt / sinkhorn 需要 fp32
+        x_flat_f = x_flat.float()
+        rsqrt = torch.rsqrt(x_flat_f.square().mean(-1, keepdim=True) + self.norm_eps)
+        mixes = mixes.float() * rsqrt
+        # Fewer Sinkhorn iterations at inference — the matrix converges quickly and
+        # extra iterations just add kernel-launch overhead in decode-bound cases.
+        iters = self.hc_sinkhorn_iters if self.training else min(self.hc_sinkhorn_iters, 5)
+        pre, post, comb = hc_split_sinkhorn(mixes, hc_scale.float(), hc_base.float(), self.hc_mult, iters, self.hc_eps)
+        y = torch.sum(pre.unsqueeze(-1) * x_flat_f.view(shape), dim=2)
         return y.to(dtype), post, comb
 
     def hc_post(self, x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor):
@@ -707,11 +737,15 @@ class ParallelHead(nn.Module):
 
     def hc_head(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor):
         shape, dtype = x.size(), x.dtype
-        x = x.flatten(2).float()
-        rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
-        mixes = F.linear(x, hc_fn.float()) * rsqrt
+        x_flat = x.flatten(2)
+        if hc_fn.dtype != x_flat.dtype:
+            hc_fn = hc_fn.to(x_flat.dtype)
+        mixes = F.linear(x_flat, hc_fn)
+        x_flat_f = x_flat.float()
+        rsqrt = torch.rsqrt(x_flat_f.square().mean(-1, keepdim=True) + self.norm_eps)
+        mixes = mixes.float() * rsqrt
         pre = torch.sigmoid(mixes * hc_scale[0].float() + hc_base.float()) + self.hc_eps
-        y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=2)
+        y = torch.sum(pre.unsqueeze(-1) * x_flat_f.view(shape), dim=2)
         return y.to(dtype)
 
 
