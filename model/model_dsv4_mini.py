@@ -34,28 +34,25 @@ def sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale):
     flat_idx = (idx_clamped + batch_offset).view(-1)                     # [bsz*seqlen*topk]
     kv_selected = kv.reshape(-1, head_dim).index_select(0, flat_idx).view(bsz, seqlen, topk, head_dim)
     kv_selected = kv_selected * valid_mask.unsqueeze(-1).type_as(kv_selected)
-    
-    # Q * K^T
-    q_trans = q.transpose(1, 2).unsqueeze(3) # [bsz, n_heads, seqlen, 1, head_dim]
-    k_trans = kv_selected.unsqueeze(1) # [bsz, 1, seqlen, topk, head_dim]
-    
-    scores = (q_trans @ k_trans.transpose(-2, -1)) * softmax_scale # [bsz, n_heads, seqlen, 1, topk]
-    
-    valid_mask_attn = valid_mask.view(bsz, 1, seqlen, 1, topk)
+
+    # Q * K^T via einsum: [bsz, seqlen, n_heads, D] × [bsz, seqlen, topk, D] → [bsz, n_heads, seqlen, topk]
+    # (K/V are shared across heads at each token position.)
+    scores = torch.einsum("bshd,bstd->bhst", q, kv_selected) * softmax_scale
+
+    valid_mask_attn = valid_mask.view(bsz, 1, seqlen, topk)              # [bsz, 1, seqlen, topk]
     scores = scores.masked_fill(~valid_mask_attn, float('-inf'))
-    
+
     # Sink (attn_sink is fp32; upcast scores briefly for stable softmax, then cast back)
-    sink_score = attn_sink.view(1, n_heads, 1, 1, 1).expand(bsz, -1, seqlen, 1, 1)
-    scores = torch.cat([scores.float(), sink_score.float()], dim=-1)
-    
+    sink_score = attn_sink.view(1, n_heads, 1, 1).expand(bsz, -1, seqlen, 1)  # [bsz, n_heads, seqlen, 1]
+    scores = torch.cat([scores.float(), sink_score.float()], dim=-1)      # [bsz, n_heads, seqlen, topk+1]
+
     probs = F.softmax(scores, dim=-1).to(kv.dtype)
-    
-    # V
-    v_sink = torch.zeros(bsz, 1, seqlen, 1, head_dim, device=k_trans.device, dtype=k_trans.dtype)
-    v_trans = torch.cat([k_trans, v_sink], dim=3)
-    
-    out = (probs @ v_trans).squeeze(3) # [bsz, n_heads, seqlen, head_dim]
-    return out.transpose(1, 2)
+
+    # V: probs [B, H, S, T+1] × v_all [B, S, T+1, D] → out [B, H, S, D]
+    v_sink = torch.zeros(bsz, seqlen, 1, head_dim, device=kv.device, dtype=kv.dtype)
+    v_all = torch.cat([kv_selected, v_sink], dim=2)                       # [bsz, seqlen, topk+1, head_dim]
+    out = torch.einsum("bhst,bstd->bhsd", probs, v_all)                   # [bsz, n_heads, seqlen, head_dim]
+    return out.transpose(1, 2)                                            # [bsz, seqlen, n_heads, head_dim]
 
 
 def hc_split_sinkhorn(mixes, hc_scale, hc_base, hc_mult, hc_sinkhorn_iters, hc_eps):
