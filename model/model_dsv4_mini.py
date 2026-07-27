@@ -887,24 +887,48 @@ class DeepSeekV4MiniForCausalLM(PreTrainedModel, GenerationMixin):
             # Only init 1D/2D general parameters. Specific ones like scaling should be initialized properly.
             torch.nn.init.normal_(module, mean=0.0, std=0.02)
 
-    # Parameter/buffer name substrings that must remain fp32 even after `to_inference_dtype()`
+    # Parameter/buffer name suffixes/patterns that must remain fp32 even after `to_inference_dtype()`
     # (softmax / rsqrt / Sinkhorn / state accumulation — all numerically sensitive).
-    _FP32_INFERENCE_KEYS = (
-        'norm.weight', 'hc_scale', 'hc_base',
-        'attn_sink', 'ape',
+    # These are FULL leaf-module.attribute keys — matching is done on module-name boundaries,
+    # so `gate.weight` will NOT match `wgate.weight`.
+    _FP32_INFERENCE_LEAF_KEYS = (
+        # HC scale/base params (Block + MTPBlock + ParallelHead + top-level)
+        'hc_attn_scale', 'hc_attn_base',
+        'hc_ffn_scale', 'hc_ffn_base',
+        'hc_head_scale', 'hc_head_base',
+        # MoE
         'gate.weight', 'gate.bias',
+        # Attention sink
+        'attn_sink',
+        # Compressor APE + states
+        'ape',
         'kv_state', 'score_state',
     )
+    # Leaf module names whose `.weight` must stay fp32 (RMSNorm family).
+    _FP32_NORM_MODULES = ('norm', 'attn_norm', 'ffn_norm', 'q_norm', 'kv_norm', 'enorm', 'hnorm')
 
     def to_inference_dtype(self, dtype=torch.bfloat16):
         """Cast the model to `dtype` (default bf16) for fast inference, but preserve
         the fp32 dtype of parameters/buffers that need numerical stability. Idempotent."""
         self.to(dtype)
+
+        def should_keep_fp32(name: str) -> bool:
+            parts = name.split('.')
+            # RMSNorm weight: last two parts are (<one of _FP32_NORM_MODULES>, 'weight')
+            if len(parts) >= 2 and parts[-1] == 'weight' and parts[-2] in self._FP32_NORM_MODULES:
+                return True
+            # Leaf-key match: check trailing 1- or 2-component suffix against keys.
+            for key in self._FP32_INFERENCE_LEAF_KEYS:
+                key_parts = key.split('.')
+                if len(parts) >= len(key_parts) and parts[-len(key_parts):] == key_parts:
+                    return True
+            return False
+
         for name, param in self.named_parameters():
-            if any(k in name for k in self._FP32_INFERENCE_KEYS):
+            if should_keep_fp32(name):
                 param.data = param.data.float()
         for name, buf in self.named_buffers():
-            if any(k in name for k in self._FP32_INFERENCE_KEYS):
+            if should_keep_fp32(name):
                 buf.data = buf.data.float()
         return self
 
