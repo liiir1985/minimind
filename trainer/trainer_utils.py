@@ -16,28 +16,49 @@ from transformers import AutoTokenizer, AutoModel, AutoModelForSequenceClassific
 from model.model_minimind import MiniMindForCausalLM
 from model.model_dsv4_mini import DeepSeekV4MiniForCausalLM
 
-def get_model_params(model, config):
+def _count_minimind_params(model, config):
+    """MiniMind: dense or MoE. Params live at `model.layers.X.mlp.experts.Y.*`."""
     total = sum(p.numel() for p in model.parameters()) / 1e6
-    n_routed = getattr(config, 'num_routed_experts', getattr(config, 'n_routed_experts', getattr(config, 'num_experts', 0)))
-    n_active = getattr(config, 'num_activated_experts', getattr(config, 'num_experts_per_tok', 0))
-    n_shared = getattr(config, 'num_shared_experts', getattr(config, 'n_shared_experts', 0))
-    n_layers = getattr(config, 'num_hidden_layers', getattr(config, 'n_layers', 1))
-    # MiniMind: `layers.X.mlp.experts.Y.*`; dsv4_mini: `layers.X.ffn.experts.Y.*` / `layers.X.ffn.shared_experts.*`
-    # Exclude MTP blocks (only active during training aux loss, not standard inference).
+    if not getattr(config, 'use_moe', False):
+        return total, total
+    n_routed = config.num_experts
+    n_active = config.num_experts_per_tok
+    n_layers = config.num_hidden_layers
+    routed_all = sum(p.numel() for n, p in model.named_parameters() if '.experts.0.' in n) / 1e6
+    expert = routed_all / max(n_layers, 1)
+    total_expert = expert * n_routed * n_layers
+    active_expert = expert * n_active * n_layers
+    active = (total - total_expert) + active_expert
+    return total, active
+
+
+def _count_dsv4_mini_params(model, config):
+    """dsv4_mini: MoE with shared expert + MTP block (skipped for inference active)."""
+    total = sum(p.numel() for p in model.parameters()) / 1e6
+    n_active = config.num_activated_experts
+    n_layers = config.num_hidden_layers
+    # Exclude MTP block (used only during training aux loss, not standard inference).
     routed_all = sum(p.numel() for n, p in model.named_parameters()
                      if '.experts.0.' in n and not n.startswith('mtp.')) / 1e6
     shared_all = sum(p.numel() for n, p in model.named_parameters()
                      if '.shared_experts.' in n and not n.startswith('mtp.')) / 1e6
-    expert = routed_all / max(n_layers, 1)          # one routed expert, per layer
+    all_moe = sum(p.numel() for n, p in model.named_parameters()
+                  if ('.experts.' in n or '.shared_experts.' in n) and not n.startswith('mtp.')) / 1e6
+    expert = routed_all / max(n_layers, 1)
     active_expert = expert * n_active * n_layers + shared_all
-    # base = everything that isn't an expert (embed/attn/head/HC/norm + MTP params which aren't in inference forward)
-    all_moe_params = sum(p.numel() for n, p in model.named_parameters()
-                         if ('.experts.' in n or '.shared_experts.' in n)
-                         and not n.startswith('mtp.')) / 1e6
-    base = total - all_moe_params
-    active = base + active_expert
-    if 0 < active < total: Logger(f'Model Params: {total:.2f}M-A{active:.2f}M')
-    else: Logger(f'Model Params: {total:.2f}M')
+    active = (total - all_moe) + active_expert
+    return total, active
+
+
+def get_model_params(model, config):
+    if getattr(config, 'model_type', None) == 'dsv4_mini':
+        total, active = _count_dsv4_mini_params(model, config)
+    else:
+        total, active = _count_minimind_params(model, config)
+    if 0 < active < total:
+        Logger(f'Model Params: {total:.2f}M-A{active:.2f}M')
+    else:
+        Logger(f'Model Params: {total:.2f}M')
 
 
 def is_main_process():

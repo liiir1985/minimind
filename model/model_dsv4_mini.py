@@ -468,6 +468,12 @@ class Attention(nn.Module):
                 self.compressor.kv_cache = self.kv_cache[:, self.window_size:]
 
         freqs_cis = self.freqs_cis[start_pos:start_pos+seqlen].to(x.device)
+        if freqs_cis.size(0) < seqlen:
+            raise RuntimeError(
+                f"Context length exceeded: start_pos={start_pos}, seqlen={seqlen}, "
+                f"but freqs_cis was precomputed for max_seq_len={self.freqs_cis.size(0)}. "
+                f"Increase --max_seq_len or enable --inference_rope_scaling."
+            )
         win = self.window_size
         ratio = self.compress_ratio
         rd = self.rope_head_dim
