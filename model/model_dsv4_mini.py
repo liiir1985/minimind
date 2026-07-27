@@ -223,22 +223,23 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = F
     Real-valued RoPE with adjacent-pair rotation (mathematically equivalent to the
     complex-valued formulation but ONNX/RKNN-friendly — no complex ops).
 
+    Pure functional: does NOT modify the input. Returns a new tensor of the same
+    shape/dtype containing the rotated values. Callers must reassemble the full
+    tensor if `x` was a rope-only slice.
+
     x:         [..., seqlen, D]       or  [..., seqlen, H, D]   (D == rope_head_dim, even)
     freqs_cis: [seqlen, D/2, 2]                       where [..., 0]=cos, [..., 1]=sin
                (caller must already slice by start_pos:start_pos+seqlen)
     inverse:   if True, apply the inverse rotation (uses -sin).
-    Modifies x in-place and returns it.
     """
     orig_dtype = x.dtype
     seqlen, d_half = freqs_cis.size(0), freqs_cis.size(1)
 
-    # freqs_cis: [seqlen, D/2, 2] → cos/sin split
     cos = freqs_cis[..., 0]                     # [seqlen, D/2]
     sin = freqs_cis[..., 1]                     # [seqlen, D/2]
     if inverse:
         sin = -sin
 
-    # Broadcast shape:
     #   x.ndim == 3 (Compressor path): x is [bsz, seqlen, D]      → cos/sin: [1, seqlen, D/2]
     #   x.ndim == 4 (Attention path):  x is [bsz, seqlen, H, D]   → cos/sin: [1, seqlen, 1, D/2]
     if x.ndim == 3:
@@ -248,20 +249,22 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = F
         cos = cos.view(1, seqlen, 1, d_half)
         sin = sin.view(1, seqlen, 1, d_half)
 
-    # Pair-wise rotation: [..., D] → [..., D/2, 2]
     x_pair = x.float().unflatten(-1, (d_half, 2))
-    x_even = x_pair[..., 0]                      # d_0, d_2, d_4, ...
-    x_odd  = x_pair[..., 1]                      # d_1, d_3, d_5, ...
+    x_even = x_pair[..., 0]
+    x_odd  = x_pair[..., 1]
 
     new_even = x_even * cos - x_odd  * sin
     new_odd  = x_even * sin + x_odd  * cos
 
-    # Interleave back: [..., D/2, 2] → [..., D]
-    out = torch.stack([new_even, new_odd], dim=-1).flatten(-2).to(orig_dtype)
-    # Preserve the original in-place-write semantics that callers rely on
-    # (they pass x[..., -rd:] and expect the slice to be modified).
-    x.copy_(out)
-    return x
+    return torch.stack([new_even, new_odd], dim=-1).flatten(-2).to(orig_dtype)
+
+
+def apply_rope_tail(x: torch.Tensor, freqs_cis: torch.Tensor, rd: int, inverse: bool = False) -> torch.Tensor:
+    """Apply RoPE to the trailing `rd` dims of `x` (out-of-place, autograd-safe).
+    Returns a new tensor with the non-rope prefix and rotated tail concatenated."""
+    if rd == x.size(-1):
+        return apply_rotary_emb(x, freqs_cis, inverse)
+    return torch.cat([x[..., :-rd], apply_rotary_emb(x[..., -rd:], freqs_cis, inverse)], dim=-1)
 
 
 @lru_cache(2)
@@ -388,7 +391,7 @@ class Compressor(nn.Module):
         else:
             freqs_cis = self.freqs_cis[start_pos + 1 - self.compress_ratio].unsqueeze(0)
         
-        apply_rotary_emb(kv[..., -rd:], freqs_cis)
+        kv = apply_rope_tail(kv, freqs_cis, rd)
         
         if not self.training:
             if start_pos == 0:
@@ -434,7 +437,7 @@ class Indexer(torch.nn.Module):
         
         q = self.wq_b(qr)
         q = q.unflatten(-1, (self.n_heads, self.head_dim))
-        apply_rotary_emb(q[..., -rd:], freqs_cis)
+        q = apply_rope_tail(q, freqs_cis, rd)
         
         kv_compress = self.compressor(x, start_pos)
         weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads ** -0.5)
@@ -532,11 +535,11 @@ class Attention(nn.Module):
         qr = q = self.q_norm(self.wq_a(x))
         q = self.wq_b(q).unflatten(-1, (self.n_heads, self.head_dim))
         q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + self.eps)
-        apply_rotary_emb(q[..., -rd:], freqs_cis)
+        q = apply_rope_tail(q, freqs_cis, rd)
 
         kv = self.wkv(x)
         kv = self.kv_norm(kv)
-        apply_rotary_emb(kv[..., -rd:], freqs_cis)
+        kv = apply_rope_tail(kv, freqs_cis, rd)
         
         topk_idxs = get_window_topk_idxs(win, bsz, seqlen, start_pos).to(x.device)
         
@@ -571,7 +574,7 @@ class Attention(nn.Module):
                 self.compressor(x, start_pos)
             o = sparse_attn(q, self.kv_cache[:bsz], self.attn_sink, topk_idxs, self.softmax_scale)
             
-        apply_rotary_emb(o[..., -rd:], freqs_cis, True)
+        o = apply_rope_tail(o, freqs_cis, rd, inverse=True)
 
         o = o.reshape(bsz, seqlen, self.n_groups, -1)
         wo_a = self.wo_a.weight.view(self.n_groups, self.o_lora_rank, -1)
