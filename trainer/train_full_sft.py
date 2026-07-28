@@ -60,7 +60,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
 
         if (step % args.save_interval == 0 or step == iters) and is_main_process():
             model.eval()
-            moe_suffix = '_moe' if lm_config.use_moe else ''
+            moe_suffix = '_moe' if getattr(lm_config, 'use_moe', False) else ''
             ckp = f'{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
             raw_model = model.module if isinstance(model, DistributedDataParallel) else model
             raw_model = getattr(raw_model, '_orig_mod', raw_model)
@@ -105,6 +105,7 @@ if __name__ == "__main__":
     parser.add_argument("--use_wandb", action="store_true", help="是否使用wandb")
     parser.add_argument("--wandb_project", type=str, default="MiniMind-Full-SFT", help="wandb项目名")
     parser.add_argument("--use_compile", default=0, type=int, choices=[0, 1], help="是否使用torch.compile加速（0=否，1=是）")
+    parser.add_argument('--model_type', default='minimind', type=str, choices=['minimind', 'dsv4_mini'], help="模型类型")
     args = parser.parse_args()
 
     # ========== 1. 初始化环境和随机种子 ==========
@@ -114,7 +115,25 @@ if __name__ == "__main__":
     
     # ========== 2. 配置目录、模型参数、检查ckp ==========
     os.makedirs(args.save_dir, exist_ok=True)
-    lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe))
+    if args.model_type == 'dsv4_mini':
+        from model.model_dsv4_mini import DeepSeekV4MiniConfig
+        
+        # 动态缩放一些关键参数以适配小显存
+        is_micro = args.hidden_size < 768
+        lm_config = DeepSeekV4MiniConfig(
+            hidden_size=args.hidden_size, 
+            num_hidden_layers=args.num_hidden_layers,
+            num_attention_heads=args.hidden_size // 128 if args.hidden_size % 128 == 0 else 4,
+            moe_inter_dim=args.hidden_size,
+            q_lora_rank=(args.hidden_size // 3 // 16 * 16) if is_micro else 256,
+            o_lora_rank=(args.hidden_size // 3 // 16 * 16) if is_micro else 256,
+            num_routed_experts=8 if is_micro else 16,
+            hc_mult=2 if is_micro else 4,
+            n_mtp_layers=0,
+            max_seq_len=args.max_seq_len,
+        )
+    else:
+        lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe))
     ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume==1 else None
     
     # ========== 3. 设置混合精度 ==========
@@ -132,7 +151,7 @@ if __name__ == "__main__":
         wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume)
     
     # ========== 5. 定义模型、数据、优化器 ==========
-    model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
+    model, tokenizer = init_model(lm_config, args.from_weight, device=args.device, model_type=args.model_type)
     train_ds = SFTDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
