@@ -82,6 +82,10 @@ def main():
     parser.add_argument('--show_speed', default=1, type=int, help="显示decode速度（tokens/s）")
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu', type=str, help="运行设备")
     parser.add_argument('--model_type', default='minimind', type=str, choices=['minimind', 'dsv4_mini'], help="模型类型")
+    parser.add_argument("--profile", default=0, type=int, choices=[0, 1], help="启用PyTorch Profiler，采样decode阶段热点")
+    parser.add_argument("--profile_dir", default="./prof_log_infer", type=str, help="profiler trace输出目录")
+    parser.add_argument("--profile_warmup", default=50, type=int, help="profile前跳过的forward步数（等待KV cache稳态）")
+    parser.add_argument("--profile_active", default=30, type=int, help="profile采样的forward步数")
     args = parser.parse_args()
     
     prompts = [
@@ -97,6 +101,37 @@ def main():
     
     conversation = []
     model, tokenizer = init_model(args)
+    if args.profile == 1:
+        # Warm up KV cache / triton autotune with one short run before profiling.
+        print(f'[Profile] Warming up ({args.profile_warmup} tokens)...')
+        warm_ids = tokenizer('你好', return_tensors='pt').input_ids.to(args.device)
+        with torch.inference_mode():
+            model.generate(inputs=warm_ids, max_new_tokens=args.profile_warmup, do_sample=False,
+                           pad_token_id=tokenizer.pad_token_id, eos_token_id=None)
+        torch.cuda.synchronize() if 'cuda' in args.device else None
+        from torch.profiler import profile, ProfilerActivity, tensorboard_trace_handler
+        activities = [ProfilerActivity.CPU]
+        if 'cuda' in args.device:
+            activities.append(ProfilerActivity.CUDA)
+        prof_ctx = profile(
+            activities=activities,
+            on_trace_ready=tensorboard_trace_handler(args.profile_dir),
+            with_stack=True,
+            record_shapes=True,
+            profile_memory=True,
+        )
+        print(f'[Profile] Recording {args.profile_active} tokens to {args.profile_dir}')
+        prompt = '请简单介绍一下你自己'
+        inputs = tokenizer(prompt, return_tensors='pt').to(args.device)
+        with prof_ctx:
+            with torch.inference_mode():
+                model.generate(inputs=inputs['input_ids'], attention_mask=inputs['attention_mask'],
+                               max_new_tokens=args.profile_active, do_sample=False,
+                               pad_token_id=tokenizer.pad_token_id, eos_token_id=None)
+            torch.cuda.synchronize() if 'cuda' in args.device else None
+        print(f'[Profile] Done. Run: tensorboard --logdir {args.profile_dir}')
+        return
+
     input_mode = int(input('[0] 自动测试\n[1] 手动输入\n'))
     streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
     

@@ -24,6 +24,19 @@ warnings.filterwarnings('ignore')
 def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
     start_time = time.time()
     last_step = start_step
+    prof = None
+    if args.profile == 1:
+        from torch.profiler import profile, ProfilerActivity, schedule, tensorboard_trace_handler
+        prof = profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            schedule=schedule(wait=1, warmup=2, active=5, repeat=1),
+            on_trace_ready=tensorboard_trace_handler(args.profile_dir),
+            with_stack=True,
+            record_shapes=True,
+            profile_memory=True,
+        )
+        prof.start()
+        Logger(f'Profiler enabled: writing to {args.profile_dir}. Will stop after wait+warmup+active=8 steps.')
     for step, (input_ids, labels) in enumerate(loader, start=start_step + 1):
         input_ids = input_ids.to(args.device)
         labels = labels.to(args.device)
@@ -47,6 +60,14 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             scaler.update()
 
             optimizer.zero_grad(set_to_none=True)
+
+        if prof is not None:
+            prof.step()
+            if step - start_step >= 8:
+                prof.stop()
+                Logger(f'Profiler finished. Run: tensorboard --logdir {args.profile_dir}')
+                prof = None
+                return
 
         if step % args.log_interval == 0 or step == iters:
             spend_time = time.time() - start_time
@@ -105,6 +126,8 @@ if __name__ == "__main__":
     parser.add_argument("--wandb_project", type=str, default="MiniMind-Pretrain", help="wandb项目名")
     parser.add_argument("--use_compile", default=0, type=int, choices=[0, 1], help="是否使用torch.compile加速（0=否，1=是）")
     parser.add_argument('--model_type', default='minimind', type=str, choices=['minimind', 'dsv4_mini'], help="模型类型")
+    parser.add_argument("--profile", default=0, type=int, choices=[0, 1], help="启用PyTorch Profiler，在前8个step采样并输出trace到--profile_dir（用tensorboard查看）")
+    parser.add_argument("--profile_dir", default="../prof_log", type=str, help="profiler trace输出目录")
     args = parser.parse_args()
 
     # ========== 1. 初始化环境和随机种子 ==========
