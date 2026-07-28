@@ -755,8 +755,10 @@ class Block(nn.Module):
         # The second term materialized a [B,S,M,M,D] intermediate. Both terms rewritten as einsum:
         #   term1[b,s,m,d] = post[b,s,m] * x[b,s,d]                     ("bsm,bsd->bsmd")
         #   term2[b,s,m,d] = Σ_n comb[b,s,n,m] * residual[b,s,n,d]     ("bsnm,bsnd->bsmd")
-        y = torch.einsum("bsm,bsd->bsmd", post, x) + torch.einsum("bsnm,bsnd->bsmd", comb, residual)
-        return y.type_as(x)
+        # einsum requires matching dtypes; post/comb are fp32 (from Sinkhorn), x/residual bf16 → cast.
+        dtype = x.dtype
+        y = torch.einsum("bsm,bsd->bsmd", post.to(dtype), x) + torch.einsum("bsnm,bsnd->bsmd", comb.to(dtype), residual)
+        return y
 
     def forward(self, x: torch.Tensor, start_pos: int, input_ids: Optional[torch.Tensor]) -> torch.Tensor:
         residual = x
