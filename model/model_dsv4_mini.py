@@ -38,21 +38,20 @@ def sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale):
     # Q * K^T via einsum: [bsz, seqlen, n_heads, D] × [bsz, seqlen, topk, D] → [bsz, n_heads, seqlen, topk]
     # (K/V are shared across heads at each token position.)
     scores = torch.einsum("bshd,bstd->bhst", q, kv_selected) * softmax_scale
-    scores = scores.masked_fill(~valid_mask.view(bsz, 1, seqlen, topk), float('-inf'))
 
-    # Fused sink: instead of cat-ing sink to K/V (materialising a [T+1] axis and a
-    # zero-V slot), we fold sink into the softmax denominator with a numerically
-    # stable max-subtract. Since sink's value slot is zero, it contributes nothing
-    # to the output — only to the normaliser.
-    sink = attn_sink.view(1, n_heads, 1, 1).to(scores.dtype)             # [1, H, 1, 1]
-    m = torch.maximum(scores.amax(dim=-1, keepdim=True), sink)           # [B, H, S, 1]
-    exp_scores = (scores - m).exp()                                      # [B, H, S, T], -inf → 0
-    exp_sink = (sink - m).exp()                                          # [B, H, S, 1]
-    denom = exp_scores.sum(dim=-1, keepdim=True) + exp_sink              # [B, H, S, 1]
-    probs = (exp_scores / denom).to(kv.dtype)                            # [B, H, S, T]
+    valid_mask_attn = valid_mask.view(bsz, 1, seqlen, topk)              # [bsz, 1, seqlen, topk]
+    scores = scores.masked_fill(~valid_mask_attn, float('-inf'))
 
-    # V: probs [B, H, S, T] × kv_selected [B, S, T, D] → out [B, H, S, D]
-    out = torch.einsum("bhst,bstd->bhsd", probs, kv_selected)            # [bsz, n_heads, seqlen, head_dim]
+    # Sink (attn_sink is fp32; upcast scores briefly for stable softmax, then cast back)
+    sink_score = attn_sink.view(1, n_heads, 1, 1).expand(bsz, -1, seqlen, 1)  # [bsz, n_heads, seqlen, 1]
+    scores = torch.cat([scores.float(), sink_score.float()], dim=-1)      # [bsz, n_heads, seqlen, topk+1]
+
+    probs = F.softmax(scores, dim=-1).to(kv.dtype)
+
+    # V: probs [B, H, S, T+1] × v_all [B, S, T+1, D] → out [B, H, S, D]
+    v_sink = torch.zeros(bsz, seqlen, 1, head_dim, device=kv.device, dtype=kv.dtype)
+    v_all = torch.cat([kv_selected, v_sink], dim=2)                       # [bsz, seqlen, topk+1, head_dim]
+    out = torch.einsum("bhst,bstd->bhsd", probs, v_all)                   # [bsz, n_heads, seqlen, head_dim]
     return out.transpose(1, 2)                                            # [bsz, seqlen, n_heads, head_dim]
 
 
@@ -233,6 +232,20 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = F
     inverse:   if True, apply the inverse rotation (uses -sin).
     """
     seqlen, d_half = freqs_cis.size(0), freqs_cis.size(1)
+
+    # Decode fast path: seqlen==1 avoids the [1, 1, ...] shape juggling and lets
+    # broadcasting handle everything with 4 element-wise kernels instead of 7+.
+    if seqlen == 1:
+        cos = freqs_cis[0, :, 0].to(x.dtype)                       # [D/2]
+        sin = freqs_cis[0, :, 1].to(x.dtype)                       # [D/2]
+        if inverse:
+            sin = -sin
+        x_pair = x.unflatten(-1, (d_half, 2))                      # [..., D/2, 2]
+        x_even = x_pair[..., 0]
+        x_odd  = x_pair[..., 1]
+        new_even = x_even * cos - x_odd  * sin
+        new_odd  = x_even * sin + x_odd  * cos
+        return torch.stack([new_even, new_odd], dim=-1).flatten(-2)
 
     cos = freqs_cis[..., 0].to(x.dtype)         # [seqlen, D/2]
     sin = freqs_cis[..., 1].to(x.dtype)         # [seqlen, D/2]
