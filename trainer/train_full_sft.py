@@ -106,6 +106,8 @@ if __name__ == "__main__":
     parser.add_argument("--wandb_project", type=str, default="MiniMind-Full-SFT", help="wandb项目名")
     parser.add_argument("--use_compile", default=0, type=int, choices=[0, 1], help="是否使用torch.compile加速（0=否，1=是）")
     parser.add_argument('--model_type', default='minimind', type=str, choices=['minimind', 'dsv4_mini'], help="模型类型")
+    parser.add_argument('--attn_chunk_size', default=0, type=int, help="dsv4_mini 稀疏注意力 Q 分块大小 (0=不分块, 走原版最快; 长上下文时设 1024/2048)")
+    parser.add_argument('--ce_chunk_size', default=0, type=int, help="dsv4_mini 交叉熵 seqlen 分块大小 (0=不分块, 走原版; 长上下文时设 1024/2048)")
     args = parser.parse_args()
 
     # ========== 1. 初始化环境和随机种子 ==========
@@ -131,6 +133,8 @@ if __name__ == "__main__":
             hc_mult=2 if is_micro else 4,
             n_mtp_layers=0,
             max_seq_len=args.max_seq_len,
+            attn_chunk_size=args.attn_chunk_size if args.attn_chunk_size > 0 else None,
+            ce_chunk_size=args.ce_chunk_size if args.ce_chunk_size > 0 else None,
         )
     else:
         lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe))
