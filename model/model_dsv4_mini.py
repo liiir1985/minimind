@@ -14,45 +14,70 @@ from transformers import PretrainedConfig, PreTrainedModel, GenerationMixin
 # PyTorch Replacements for DeepSeek Custom Kernels
 # -----------------------------------------------------------------------------
 
-def sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale):
+def sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale, chunk_size: int = 1024):
     """
-    Pure PyTorch implementation of DeepSeek's sparse attention kernel.
+    Chunked sparse attention. Mathematically identical to the previous version, but:
+      1. Q is split along seqlen into `chunk_size` blocks so peak activation is
+         O(chunk · topk · D) instead of O(S · topk · D). At training time each
+         chunk is wrapped in `checkpoint(..., use_reentrant=False)` so its
+         intermediates (kv_sel, scores, probs) are freed after forward and only
+         re-materialized during that chunk's own backward.
+      2. `attn_sink` is folded into the softmax denominator: since v_sink is 0,
+         the sink term contributes 0 to `out` — it only affects normalization —
+         so the [B, S, topk+1, D] `v_all` cat and the zero `v_sink` allocation
+         are unnecessary.
+
     q: [bsz, seqlen, n_heads, head_dim]
     kv: [bsz, cache_len, head_dim]
     topk_idxs: [bsz, seqlen, topk]
-    attn_sink: [n_heads]
+    attn_sink: [n_heads]  (fp32)
     """
     bsz, seqlen, n_heads, head_dim = q.shape
     topk = topk_idxs.shape[2]
     cache_len = kv.size(1)
+    kv_dtype = kv.dtype
 
-    # Gather KV via flat index_select — avoids the [bsz, seqlen, cache_len, head_dim]
-    # intermediate that expand+gather would materialize.
-    valid_mask = topk_idxs >= 0                                          # [bsz, seqlen, topk]
-    idx_clamped = topk_idxs.clamp(min=0).long()                          # [bsz, seqlen, topk]
+    kv_flat = kv.reshape(-1, head_dim)
     batch_offset = (torch.arange(bsz, device=kv.device) * cache_len).view(bsz, 1, 1)
-    flat_idx = (idx_clamped + batch_offset).view(-1)                     # [bsz*seqlen*topk]
-    kv_selected = kv.reshape(-1, head_dim).index_select(0, flat_idx).view(bsz, seqlen, topk, head_dim)
-    kv_selected = kv_selected * valid_mask.unsqueeze(-1).type_as(kv_selected)
+    sink_bhs1 = attn_sink.view(1, n_heads, 1, 1).float()  # [1, H, 1, 1], fp32
 
-    # Q * K^T via einsum: [bsz, seqlen, n_heads, D] × [bsz, seqlen, topk, D] → [bsz, n_heads, seqlen, topk]
-    # (K/V are shared across heads at each token position.)
-    scores = torch.einsum("bshd,bstd->bhst", q, kv_selected) * softmax_scale
+    def _chunk(q_c, idx_c):
+        c = q_c.size(1)
+        valid_c = idx_c >= 0
+        idx_clamped = idx_c.clamp(min=0).long()
+        flat_idx = (idx_clamped + batch_offset).view(-1)
+        kv_sel = kv_flat.index_select(0, flat_idx).view(bsz, c, topk, head_dim)
+        kv_sel = kv_sel * valid_c.unsqueeze(-1).type_as(kv_sel)
 
-    valid_mask_attn = valid_mask.view(bsz, 1, seqlen, topk)              # [bsz, 1, seqlen, topk]
-    scores = scores.masked_fill(~valid_mask_attn, float('-inf'))
+        scores = torch.einsum("bshd,bstd->bhst", q_c, kv_sel) * softmax_scale
+        scores = scores.masked_fill(~valid_c.view(bsz, 1, c, topk), float('-inf'))
 
-    # Sink (attn_sink is fp32; upcast scores briefly for stable softmax, then cast back)
-    sink_score = attn_sink.view(1, n_heads, 1, 1).expand(bsz, -1, seqlen, 1)  # [bsz, n_heads, seqlen, 1]
-    scores = torch.cat([scores.float(), sink_score.float()], dim=-1)      # [bsz, n_heads, seqlen, topk+1]
+        # Sink-folded stable softmax (fp32).
+        scores_f = scores.float()
+        m_scores = scores_f.max(dim=-1, keepdim=True)[0]         # [B, H, C, 1]
+        m = torch.maximum(m_scores, sink_bhs1)                    # [B, H, C, 1]
+        exp_scores = (scores_f - m).exp()
+        exp_sink = (sink_bhs1 - m).exp()
+        denom = exp_scores.sum(dim=-1, keepdim=True) + exp_sink
+        probs = (exp_scores / denom).to(kv_dtype)                 # [B, H, C, topk]
 
-    probs = F.softmax(scores, dim=-1).to(kv.dtype)
+        out_c = torch.einsum("bhst,bstd->bhsd", probs, kv_sel)    # [B, H, C, D]
+        return out_c.transpose(1, 2)                              # [B, C, H, D]
 
-    # V: probs [B, H, S, T+1] × v_all [B, S, T+1, D] → out [B, H, S, D]
-    v_sink = torch.zeros(bsz, seqlen, 1, head_dim, device=kv.device, dtype=kv.dtype)
-    v_all = torch.cat([kv_selected, v_sink], dim=2)                       # [bsz, seqlen, topk+1, head_dim]
-    out = torch.einsum("bhst,bstd->bhsd", probs, v_all)                   # [bsz, n_heads, seqlen, head_dim]
-    return out.transpose(1, 2)                                            # [bsz, seqlen, n_heads, head_dim]
+    if chunk_size is None or chunk_size >= seqlen:
+        return _chunk(q, topk_idxs)
+
+    outs = []
+    for s0 in range(0, seqlen, chunk_size):
+        s1 = min(s0 + chunk_size, seqlen)
+        q_c = q[:, s0:s1]
+        idx_c = topk_idxs[:, s0:s1]
+        if q.requires_grad:
+            out_c = checkpoint(_chunk, q_c, idx_c, use_reentrant=False)
+        else:
+            out_c = _chunk(q_c, idx_c)
+        outs.append(out_c)
+    return torch.cat(outs, dim=1)
 
 
 def hc_split_sinkhorn(mixes, hc_scale, hc_base, hc_mult, hc_sinkhorn_iters, hc_eps):
@@ -972,17 +997,44 @@ class DeepSeekV4MiniForCausalLM(PreTrainedModel, GenerationMixin):
                 h, layer_aux = layer(h, start_pos, input_ids)
             aux_loss = aux_loss + layer_aux
 
-        logits = self.head(h, self.hc_head_fn, self.hc_head_scale, self.hc_head_base, self.norm)
-        
         loss = None
         if labels is not None:
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            loss_fct = nn.CrossEntropyLoss()
-            shift_logits = shift_logits.view(-1, self.config.vocab_size)
-            shift_labels = shift_labels.view(-1)
-            shift_labels = shift_labels.to(shift_logits.device)
-            loss = loss_fct(shift_logits, shift_labels)
+            # Chunked CE along seqlen — avoids materializing the [B, S, V] fp32
+            # logits tensor (which is ~12.8 GB at S=100k, V=32k). Each chunk
+            # independently applies (hc_head + norm + linear + CE) and only its
+            # own [B, chunk, V] logits ever exist. Mathematically identical to
+            # the un-chunked version since CE is a per-token sum.
+            weight = self.head.weight
+            V = self.config.vocab_size
+            S = h.size(1)
+            chunk = 1024
+            total_loss = h.new_zeros((), dtype=torch.float32)
+            total_count = 0
+            labels_dev = labels.to(h.device)
+            # Predict label at position p+1 from hidden at position p; valid p in [0, S-2].
+            for s0 in range(0, S - 1, chunk):
+                s1 = min(s0 + chunk, S - 1)
+                h_chunk = h[:, s0:s1]
+                x_chunk = self.head.hc_head(h_chunk, self.hc_head_fn, self.hc_head_scale, self.hc_head_base)
+                x_chunk = self.norm(x_chunk).to(weight.dtype)
+                logits_chunk = F.linear(x_chunk, weight).float()          # [B, chunk, V]
+                labels_chunk = labels_dev[:, s0 + 1:s1 + 1]
+                valid = labels_chunk != -100
+                total_loss = total_loss + F.cross_entropy(
+                    logits_chunk.reshape(-1, V),
+                    labels_chunk.reshape(-1),
+                    ignore_index=-100,
+                    reduction='sum',
+                )
+                total_count += int(valid.sum().item())
+            loss = total_loss / max(total_count, 1)
+            # Return only the last-position logits — a tiny [B, 1, V] slice —
+            # to preserve HF API compatibility for callers that peek at .logits.
+            last_h = h[:, -1:]
+            last_x = self.head.hc_head(last_h, self.hc_head_fn, self.hc_head_scale, self.hc_head_base)
+            logits = F.linear(self.norm(last_x).to(weight.dtype), weight).float()
+        else:
+            logits = self.head(h, self.hc_head_fn, self.hc_head_scale, self.hc_head_base, self.norm)
 
         return MoeCausalLMOutputWithPast(
             loss=loss,
