@@ -10,103 +10,6 @@ from torch.utils.checkpoint import checkpoint
 from transformers import PretrainedConfig, PreTrainedModel, GenerationMixin
 
 
-# -----------------------------------------------------------------------------
-# PyTorch Replacements for DeepSeek Custom Kernels
-# -----------------------------------------------------------------------------
-
-def sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale, chunk_size=None):
-    """
-    Sparse attention with three modes selected by `chunk_size`:
-
-      * `chunk_size is None` (default): run the original one-shot kernel —
-        materialize `kv_selected` and `v_all`, use `F.softmax` (single fused
-        kernel). Fastest for short seqlens where the full [B,S,topk,D] tensor
-        fits comfortably in memory.
-
-      * `chunk_size >= seqlen`: run the fused-sink kernel exactly once (no
-        chunk loop, no checkpoint). Avoids the [B,S,topk+1,D] `v_all` cat by
-        folding the zero-`v_sink` sink into the softmax denominator.
-
-      * `chunk_size < seqlen`: split Q along seqlen into `chunk_size` blocks.
-        Peak activation drops from O(S·topk·D) to O(chunk·topk·D). Under
-        `q.requires_grad`, each chunk is wrapped in `checkpoint(..., use_reentrant=False)`
-        so its intermediates are freed after forward and re-materialized on backward.
-
-    q: [bsz, seqlen, n_heads, head_dim]
-    kv: [bsz, cache_len, head_dim]
-    topk_idxs: [bsz, seqlen, topk]
-    attn_sink: [n_heads]  (fp32)
-    """
-    bsz, seqlen, n_heads, head_dim = q.shape
-    topk = topk_idxs.shape[2]
-    cache_len = kv.size(1)
-    kv_dtype = kv.dtype
-
-    # --- Original one-shot path (fastest for short seqlens) ---
-    if chunk_size is None:
-        valid_mask = topk_idxs >= 0
-        idx_clamped = topk_idxs.clamp(min=0).long()
-        batch_offset = (torch.arange(bsz, device=kv.device) * cache_len).view(bsz, 1, 1)
-        flat_idx = (idx_clamped + batch_offset).view(-1)
-        kv_selected = kv.reshape(-1, head_dim).index_select(0, flat_idx).view(bsz, seqlen, topk, head_dim)
-        kv_selected = kv_selected * valid_mask.unsqueeze(-1).type_as(kv_selected)
-
-        scores = torch.einsum("bshd,bstd->bhst", q, kv_selected) * softmax_scale
-        scores = scores.masked_fill(~valid_mask.view(bsz, 1, seqlen, topk), float('-inf'))
-
-        sink_score = attn_sink.view(1, n_heads, 1, 1).expand(bsz, -1, seqlen, 1)
-        scores = torch.cat([scores.float(), sink_score.float()], dim=-1)
-        probs = F.softmax(scores, dim=-1).to(kv_dtype)
-
-        v_sink = torch.zeros(bsz, seqlen, 1, head_dim, device=kv.device, dtype=kv_dtype)
-        v_all = torch.cat([kv_selected, v_sink], dim=2)
-        out = torch.einsum("bhst,bstd->bhsd", probs, v_all)
-        return out.transpose(1, 2)
-
-    # --- Fused-sink / chunked paths ---
-    kv_flat = kv.reshape(-1, head_dim)
-    batch_offset = (torch.arange(bsz, device=kv.device) * cache_len).view(bsz, 1, 1)
-    sink_bhs1 = attn_sink.view(1, n_heads, 1, 1).float()  # [1, H, 1, 1], fp32
-
-    def _chunk(q_c, idx_c):
-        c = q_c.size(1)
-        valid_c = idx_c >= 0
-        idx_clamped = idx_c.clamp(min=0).long()
-        flat_idx = (idx_clamped + batch_offset).view(-1)
-        kv_sel = kv_flat.index_select(0, flat_idx).view(bsz, c, topk, head_dim)
-        kv_sel = kv_sel * valid_c.unsqueeze(-1).type_as(kv_sel)
-
-        scores = torch.einsum("bshd,bstd->bhst", q_c, kv_sel) * softmax_scale
-        scores = scores.masked_fill(~valid_c.view(bsz, 1, c, topk), float('-inf'))
-
-        # Sink-folded stable softmax (fp32).
-        scores_f = scores.float()
-        m_scores = scores_f.max(dim=-1, keepdim=True)[0]         # [B, H, C, 1]
-        m = torch.maximum(m_scores, sink_bhs1)                    # [B, H, C, 1]
-        exp_scores = (scores_f - m).exp()
-        exp_sink = (sink_bhs1 - m).exp()
-        denom = exp_scores.sum(dim=-1, keepdim=True) + exp_sink
-        probs = (exp_scores / denom).to(kv_dtype)                 # [B, H, C, topk]
-
-        out_c = torch.einsum("bhst,bstd->bhsd", probs, kv_sel)    # [B, H, C, D]
-        return out_c.transpose(1, 2)                              # [B, C, H, D]
-
-    if chunk_size >= seqlen:
-        return _chunk(q, topk_idxs)
-
-    outs = []
-    for s0 in range(0, seqlen, chunk_size):
-        s1 = min(s0 + chunk_size, seqlen)
-        q_c = q[:, s0:s1]
-        idx_c = topk_idxs[:, s0:s1]
-        if q.requires_grad:
-            out_c = checkpoint(_chunk, q_c, idx_c, use_reentrant=False)
-        else:
-            out_c = _chunk(q_c, idx_c)
-        outs.append(out_c)
-    return torch.cat(outs, dim=1)
-
-
 def hc_split_sinkhorn(mixes, hc_scale, hc_base, hc_mult, hc_sinkhorn_iters, hc_eps):
     """
     Pure PyTorch implementation of Sinkhorn splitting for Hyper-Connections.
@@ -155,13 +58,10 @@ class DeepSeekV4MiniConfig(PretrainedConfig):
         route_scale=1.0,
         swiglu_limit=0.0,
         norm_eps=1e-6,
-        window_size=128,
-        compress_ratios=(0, 0, 4, 128, 4, 128, 4, 0),
+        window_size=512,
+        compress_ratios=(0, 0, 4, 64, 4, 64, 4, 0),
         rope_theta=10000.0,
-        index_n_heads=8,
-        index_head_dim=128,
-        index_topk=512,
-        hc_mult=4,
+        hc_mult=0,
         hc_sinkhorn_iters=10,
         hc_eps=1e-6,
         n_hash_layers=0,
@@ -175,8 +75,8 @@ class DeepSeekV4MiniConfig(PretrainedConfig):
         original_seq_len=2048,
         beta_fast=32,
         beta_slow=1,
-        # Chunking knobs (default None = original one-shot path, fastest for short seqlens).
-        # Set to a chunk size (e.g. 1024/2048) for long-context training to cap peak activation.
+        # HCA training chunk size. None uses `window_size`, avoiding full-sequence attention masks.
+        # Set explicitly (e.g. 1024/2048) to tune activation/throughput tradeoffs.
         attn_chunk_size=None,
         ce_chunk_size=None,
         **kwargs,
@@ -204,9 +104,6 @@ class DeepSeekV4MiniConfig(PretrainedConfig):
         else:
             self.compress_ratios = [0] * num_hidden_layers
         self.rope_theta = rope_theta
-        self.index_n_heads = index_n_heads
-        self.index_head_dim = index_head_dim
-        self.index_topk = index_topk
         self.hc_mult = hc_mult
         self.hc_sinkhorn_iters = hc_sinkhorn_iters
         self.hc_eps = hc_eps
@@ -337,31 +234,6 @@ def apply_rope_tail(x: torch.Tensor, freqs_cis: torch.Tensor, rd: int, inverse: 
     return torch.cat([x[..., :-rd], apply_rotary_emb(x[..., -rd:], freqs_cis, inverse)], dim=-1)
 
 
-@lru_cache(2)
-def get_window_topk_idxs(window_size: int, bsz: int, seqlen: int, start_pos: int):
-    if start_pos >= window_size - 1:
-        start_pos %= window_size
-        matrix = torch.cat([torch.arange(start_pos + 1, window_size),  torch.arange(0, start_pos + 1)], dim=0)
-    elif start_pos > 0:
-        matrix = F.pad(torch.arange(start_pos + 1), (0, window_size - start_pos - 1), value=-1)
-    else:
-        base = torch.arange(seqlen).unsqueeze(1)
-        matrix = (base - window_size + 1).clamp(0) + torch.arange(min(seqlen, window_size))
-        matrix = torch.where(matrix > base, -1, matrix)
-    return matrix.unsqueeze(0).expand(bsz, -1, -1)
-
-
-@lru_cache(2)
-def get_compress_topk_idxs(ratio: int, bsz: int, seqlen: int, start_pos: int, offset: int):
-    if start_pos > 0:
-        matrix = torch.arange(0, (start_pos + 1) // ratio) + offset
-    else:
-        matrix = torch.arange(seqlen // ratio).repeat(seqlen, 1)
-        mask = matrix >= torch.arange(1, seqlen + 1).unsqueeze(1) // ratio
-        matrix = torch.where(mask, -1, matrix + offset)
-    return matrix.unsqueeze(0).expand(bsz, -1, -1)
-
-
 # -----------------------------------------------------------------------------
 # DeepSeekV4 Mini Modules
 # -----------------------------------------------------------------------------
@@ -476,59 +348,6 @@ class Compressor(nn.Module):
         return kv
 
 
-class Indexer(torch.nn.Module):
-    def __init__(self, config: DeepSeekV4MiniConfig, compress_ratio: int = 4):
-        super().__init__()
-        self.dim = config.hidden_size
-        self.n_heads = config.index_n_heads
-        self.head_dim = config.index_head_dim
-        self.rope_head_dim = config.rope_head_dim
-        self.index_topk = config.index_topk
-        self.q_lora_rank = config.q_lora_rank
-        self.wq_b = nn.Linear(self.q_lora_rank, self.n_heads * self.head_dim, bias=False)
-        self.weights_proj = nn.Linear(self.dim, self.n_heads, bias=False)
-        self.softmax_scale = self.head_dim ** -0.5
-        self.compress_ratio = compress_ratio
-
-        self.compressor = Compressor(config, compress_ratio, self.head_dim)
-
-    def forward(self, x: torch.Tensor, qr: torch.Tensor, start_pos: int, offset: int):
-        bsz, seqlen, _ = x.size()
-
-        freqs_cis = self.compressor.freqs_cis[start_pos:start_pos+seqlen]
-        ratio = self.compress_ratio
-        rd = self.rope_head_dim
-        end_pos = start_pos + seqlen
-
-        q = self.wq_b(qr)
-        q = q.unflatten(-1, (self.n_heads, self.head_dim))
-        q = apply_rope_tail(q, freqs_cis, rd)
-
-        kv_compress = self.compressor(x, start_pos)
-        weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads ** -0.5)
-
-        if self.training and start_pos == 0 and kv_compress is not None:
-            # Take kv directly from Compressor return to keep gradients flowing.
-            index_kv = kv_compress
-        else:
-            index_kv = self.compressor.kv_cache[:bsz, :end_pos // ratio]
-        index_score = torch.einsum("bshd,btd->bsht", q, index_kv)
-        index_score = (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
-        
-        if start_pos == 0:
-            mask = torch.arange(seqlen // ratio).repeat(seqlen, 1) >= torch.arange(1, seqlen + 1).unsqueeze(1) // ratio
-            index_score += torch.where(mask.to(index_score.device), float("-inf"), 0)
-        
-        topk_idxs = index_score.topk(min(self.index_topk, end_pos // ratio), dim=-1)[1]
-        
-        if start_pos == 0:
-            mask = topk_idxs >= torch.arange(1, seqlen + 1).unsqueeze(1).to(topk_idxs.device) // ratio
-            topk_idxs = torch.where(mask, -1, topk_idxs + offset)
-        else:
-            topk_idxs += offset
-        return topk_idxs
-
-
 class Attention(nn.Module):
     def __init__(self, layer_id: int, config: DeepSeekV4MiniConfig):
         super().__init__()
@@ -545,13 +364,13 @@ class Attention(nn.Module):
         self.eps = config.norm_eps
         self.attn_chunk_size = config.attn_chunk_size
 
-        self.attn_sink = nn.Parameter(torch.empty(self.n_heads, dtype=torch.float32))
-        nn.init.zeros_(self.attn_sink)
         self.wq_a = nn.Linear(self.dim, self.q_lora_rank, bias=False)
         self.q_norm = RMSNorm(self.q_lora_rank, self.eps)
         self.wq_b = nn.Linear(self.q_lora_rank, self.n_heads * self.head_dim, bias=False)
         self.wkv = nn.Linear(self.dim, self.head_dim, bias=False)
         self.kv_norm = RMSNorm(self.head_dim, self.eps)
+        self.comp_gate = nn.Linear(self.dim, self.n_heads, bias=True)
+        self.comp_gate._is_hca_comp_gate = True
         
         self.wo_a = nn.Linear(self.n_heads * self.head_dim // self.n_groups, self.n_groups * self.o_lora_rank, bias=False)
         self.wo_b = nn.Linear(self.n_groups * self.o_lora_rank, self.dim, bias=False)
@@ -559,10 +378,6 @@ class Attention(nn.Module):
 
         if self.compress_ratio:
             self.compressor = Compressor(config, self.compress_ratio, self.head_dim)
-            if self.compress_ratio == 4:
-                self.indexer = Indexer(config, self.compress_ratio)
-            else:
-                self.indexer = None
 
         kv_cache_size = self.window_size
         self.register_buffer("kv_cache", torch.zeros(1, kv_cache_size, self.head_dim), persistent=False)
@@ -572,6 +387,88 @@ class Attention(nn.Module):
         freqs_cis = precompute_freqs_cis(self.rope_head_dim, config.max_seq_len, config.rope_theta,
                                           yarn_orig, yarn_factor, config.beta_fast, config.beta_slow)
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
+
+    def _sdpa_single_kv(
+        self,
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        attn_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """SDPA for multi-head Q over one shared latent K/V bank.
+
+        q:  [B, S, H, D]
+        kv: [B, T, D]
+        returns [B, S, H, D]
+        """
+        bsz, _, n_heads, _ = q.shape
+        q = q.transpose(1, 2)
+        k = kv[:, None].expand(bsz, n_heads, -1, -1)
+        v = k
+        out = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            dropout_p=0.0,
+            is_causal=False,
+            scale=self.softmax_scale,
+        )
+        return out.transpose(1, 2)
+
+    def _ordered_window_cache(self, bsz: int, start_pos: int) -> torch.Tensor:
+        win = self.window_size
+        cache = self.kv_cache[:bsz]
+        if start_pos < win:
+            return cache[:, : start_pos + 1]
+        pos = start_pos % win
+        return torch.cat([cache[:, pos + 1 :], cache[:, : pos + 1]], dim=1)
+
+    def _raw_sliding_sdpa(self, q: torch.Tensor, kv: torch.Tensor, start_pos: int) -> torch.Tensor:
+        bsz, seqlen, _, _ = q.shape
+        win = self.window_size
+
+        if start_pos > 0:
+            return self._sdpa_single_kv(q, self._ordered_window_cache(bsz, start_pos))
+
+        chunk = self.attn_chunk_size or win
+        out = torch.empty_like(q)
+        device = q.device
+        for s0 in range(0, seqlen, chunk):
+            s1 = min(s0 + chunk, seqlen)
+            k0 = max(0, s0 - win + 1)
+            kv_c = kv[:, k0:s1]
+            q_pos = torch.arange(s0, s1, device=device).view(-1, 1)
+            k_pos = torch.arange(k0, s1, device=device).view(1, -1)
+            mask = (k_pos <= q_pos) & (k_pos >= q_pos - win + 1)
+            out[:, s0:s1] = self._sdpa_single_kv(q[:, s0:s1], kv_c, mask)
+        return out
+
+    def _compressed_prefix_len(self, pos: int) -> int:
+        if not self.compress_ratio:
+            return 0
+        # A compressed block ending at e is visible only after it is outside the raw window:
+        # e <= pos - window_size.  Blocks are written at index end // ratio.
+        return max(0, (pos - self.window_size + 1) // self.compress_ratio)
+
+    def _far_compressed_sdpa(self, q: torch.Tensor, comp_kv: torch.Tensor | None, start_pos: int) -> torch.Tensor:
+        out = torch.zeros_like(q)
+        if comp_kv is None or comp_kv.size(1) == 0:
+            return out
+
+        if start_pos > 0:
+            prefix_len = min(self._compressed_prefix_len(start_pos), comp_kv.size(1))
+            if prefix_len > 0:
+                return self._sdpa_single_kv(q, comp_kv[:, :prefix_len])
+            return out
+
+        seqlen = q.size(1)
+        chunk = self.attn_chunk_size or self.window_size
+        for s0 in range(0, seqlen, chunk):
+            s1 = min(s0 + chunk, seqlen)
+            prefix_len = min(self._compressed_prefix_len(s0), comp_kv.size(1))
+            if prefix_len > 0:
+                out[:, s0:s1] = self._sdpa_single_kv(q[:, s0:s1], comp_kv[:, :prefix_len])
+        return out
 
     def forward(self, x: torch.Tensor, start_pos: int):
         bsz, seqlen, _ = x.size()
@@ -587,10 +484,9 @@ class Attention(nn.Module):
                 f"Increase --max_seq_len or enable --inference_rope_scaling."
             )
         win = self.window_size
-        ratio = self.compress_ratio
         rd = self.rope_head_dim
 
-        qr = q = self.q_norm(self.wq_a(x))
+        q = self.q_norm(self.wq_a(x))
         q = self.wq_b(q).unflatten(-1, (self.n_heads, self.head_dim))
         q = F.rms_norm(q, (self.head_dim,), eps=self.eps)
         q = apply_rope_tail(q, freqs_cis, rd)
@@ -598,18 +494,6 @@ class Attention(nn.Module):
         kv = self.wkv(x)
         kv = self.kv_norm(kv)
         kv = apply_rope_tail(kv, freqs_cis, rd)
-        
-        topk_idxs = get_window_topk_idxs(win, bsz, seqlen, start_pos).to(x.device)
-        
-        if self.compress_ratio:
-            offset = kv.size(1) if start_pos == 0 else win
-            if self.indexer is not None:
-                compress_topk_idxs = self.indexer(x, qr, start_pos, offset)
-            else:
-                compress_topk_idxs = get_compress_topk_idxs(ratio, bsz, seqlen, start_pos, offset).to(x.device)
-            topk_idxs = torch.cat([topk_idxs, compress_topk_idxs], dim=-1)
-        
-        topk_idxs = topk_idxs.int()
 
         if start_pos == 0:
             if not self.training:
@@ -619,21 +503,24 @@ class Attention(nn.Module):
                     cutoff = seqlen % win
                     kv_win = kv[:, -win:].detach()
                     self.kv_cache[:bsz, cutoff: win], self.kv_cache[:bsz, :cutoff] = kv_win.split([win - cutoff, cutoff], dim=1)
+            comp_kv = None
             if self.compress_ratio:
-                kv_compress = self.compressor(x, start_pos)
-                if kv_compress is not None:
-                    kv = torch.cat([kv, kv_compress], dim=1)
-            
-            o = sparse_attn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale, self.attn_chunk_size)
+                comp_kv = self.compressor(x, start_pos)
+            o = self._raw_sliding_sdpa(q, kv, start_pos)
+            if self.compress_ratio:
+                o_comp = self._far_compressed_sdpa(q, comp_kv, start_pos)
+                gate = torch.sigmoid(self.comp_gate(x)).unsqueeze(-1).to(o.dtype)
+                o = o + gate * o_comp
         else:
             if not self.training:
                 self.kv_cache[:bsz, start_pos % win] = kv.squeeze(1).detach()
             if self.compress_ratio:
                 self.compressor(x, start_pos)
-                kv_full = torch.cat([self.kv_cache[:bsz], self.compressor.kv_cache[:bsz]], dim=1)
-            else:
-                kv_full = self.kv_cache[:bsz]
-            o = sparse_attn(q, kv_full, self.attn_sink, topk_idxs, self.softmax_scale, self.attn_chunk_size)
+            o = self._raw_sliding_sdpa(q, kv, start_pos)
+            if self.compress_ratio:
+                o_comp = self._far_compressed_sdpa(q, self.compressor.kv_cache[:bsz], start_pos)
+                gate = torch.sigmoid(self.comp_gate(x)).unsqueeze(-1).to(o.dtype)
+                o = o + gate * o_comp
             
         o = apply_rope_tail(o, freqs_cis, rd, inverse=True)
 
@@ -995,7 +882,10 @@ class DeepSeekV4MiniForCausalLM(PreTrainedModel, GenerationMixin):
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
+        if getattr(module, "_is_hca_comp_gate", False):
+            torch.nn.init.zeros_(module.weight)
+            torch.nn.init.constant_(module.bias, -2.0)
+        elif isinstance(module, nn.Linear):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
@@ -1016,8 +906,6 @@ class DeepSeekV4MiniForCausalLM(PreTrainedModel, GenerationMixin):
         'hc_head_scale', 'hc_head_base',
         # MoE
         'gate.weight', 'gate.bias',
-        # Attention sink
-        'attn_sink',
         # Compressor APE + states
         'ape',
         'kv_state', 'score_state',

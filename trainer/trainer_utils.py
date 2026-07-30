@@ -14,7 +14,7 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import Sampler
 from transformers import AutoTokenizer, AutoModel, AutoModelForSequenceClassification
 from model.model_minimind import MiniMindForCausalLM
-from model.model_dsv4_mini import DeepSeekV4MiniForCausalLM
+from model.model_dsv4_mini import DeepSeekV4MiniConfig, DeepSeekV4MiniForCausalLM
 
 def _count_minimind_params(model, config):
     """MiniMind: dense or MoE. Params live at `model.layers.X.mlp.experts.Y.*`."""
@@ -72,6 +72,40 @@ def Logger(content):
 
 def get_lr(current_step, total_steps, lr):
     return lr*(0.1 + 0.45*(1 + math.cos(math.pi * current_step / total_steps)))
+
+
+def build_dsv4_mini_config(args, inference: bool = False):
+    is_micro = args.hidden_size < 768
+    inference_rope_scaling = bool(getattr(args, "inference_rope_scaling", False)) if inference else False
+    rope_factor = getattr(args, "rope_factor", 16.0)
+    trained_max_seq_len = args.max_seq_len
+    max_seq_len = int(trained_max_seq_len * rope_factor) if inference_rope_scaling else trained_max_seq_len
+
+    lm_config = DeepSeekV4MiniConfig(
+        hidden_size=args.hidden_size,
+        num_hidden_layers=args.num_hidden_layers,
+        num_attention_heads=args.hidden_size // 128 if args.hidden_size % 128 == 0 else 4,
+        moe_inter_dim=math.ceil(args.hidden_size * math.pi / 64) * 64,
+        q_lora_rank=(args.hidden_size // 3 // 16 * 16) if is_micro else 256,
+        o_lora_rank=(args.hidden_size // 3 // 16 * 16) if is_micro else 256,
+        num_routed_experts=1,
+        num_shared_experts=0,
+        max_seq_len=max_seq_len,
+        attn_chunk_size=getattr(args, "attn_chunk_size", 0) if getattr(args, "attn_chunk_size", 0) > 0 else None,
+        ce_chunk_size=getattr(args, "ce_chunk_size", 0) if getattr(args, "ce_chunk_size", 0) > 0 else None,
+        inference_rope_scaling=inference_rope_scaling,
+        rope_factor=rope_factor,
+        original_seq_len=trained_max_seq_len,
+    )
+
+    if getattr(args, "use_moe", 0) == 1:
+        lm_config.num_routed_experts = 16
+        lm_config.num_shared_experts = 1
+    else:
+        lm_config.num_routed_experts = 1
+        lm_config.num_shared_experts = 0
+
+    return lm_config
 
 
 def init_distributed_mode():

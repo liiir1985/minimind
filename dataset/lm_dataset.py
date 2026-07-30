@@ -43,7 +43,7 @@ class PretrainDataset(Dataset):
         self.max_length = max_length
         self.samples = []
         
-        cache_path = data_path + f".packed_{max_length}.npy"
+        cache_path = data_path + f".packed_{max_length}_vocab{len(tokenizer)}.npy"
         
         import torch.distributed as dist
         is_dist = dist.is_initialized()

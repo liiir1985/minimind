@@ -6,7 +6,7 @@ import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, TextStreamer
 from model.model_minimind import MiniMindConfig, MiniMindForCausalLM
 from model.model_lora import *
-from trainer.trainer_utils import setup_seed, get_model_params
+from trainer.trainer_utils import setup_seed, get_model_params, build_dsv4_mini_config
 warnings.filterwarnings('ignore')
 
 def init_model(args):
@@ -16,26 +16,8 @@ def init_model(args):
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
     if 'model' in args.load_from:
         if args.model_type == 'dsv4_mini':
-            from model.model_dsv4_mini import DeepSeekV4MiniConfig, DeepSeekV4MiniForCausalLM
-            is_micro = args.hidden_size < 768
-            # max_seq_len is the trained context length. When YaRN is enabled,
-            # the effective context extends to max_seq_len * rope_factor.
-            effective_max = int(args.max_seq_len * args.rope_factor) if args.inference_rope_scaling else args.max_seq_len
-            lm_config = DeepSeekV4MiniConfig(
-                hidden_size=args.hidden_size, 
-                num_hidden_layers=args.num_hidden_layers,
-                num_attention_heads=args.hidden_size // 128 if args.hidden_size % 128 == 0 else 4,
-                moe_inter_dim=args.hidden_size,
-                q_lora_rank=(args.hidden_size // 3 // 16 * 16) if is_micro else 256,
-                o_lora_rank=(args.hidden_size // 3 // 16 * 16) if is_micro else 256,
-                num_routed_experts=8 if is_micro else 16,
-                hc_mult=2 if is_micro else 4,
-                n_mtp_layers=0,
-                max_seq_len=effective_max,
-                inference_rope_scaling=args.inference_rope_scaling,
-                rope_factor=args.rope_factor,
-                original_seq_len=args.max_seq_len,
-            )
+            from model.model_dsv4_mini import DeepSeekV4MiniForCausalLM
+            lm_config = build_dsv4_mini_config(args, inference=True)
             model = DeepSeekV4MiniForCausalLM(lm_config)
             moe_suffix = ''
         else:

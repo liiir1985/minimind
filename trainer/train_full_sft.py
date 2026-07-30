@@ -16,7 +16,7 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from model.model_minimind import MiniMindConfig
 from dataset.lm_dataset import SFTDataset
-from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, init_model, SkipBatchSampler
+from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, init_model, SkipBatchSampler, build_dsv4_mini_config
 
 warnings.filterwarnings('ignore')
 
@@ -106,7 +106,7 @@ if __name__ == "__main__":
     parser.add_argument("--wandb_project", type=str, default="MiniMind-Full-SFT", help="wandb项目名")
     parser.add_argument("--use_compile", default=0, type=int, choices=[0, 1], help="是否使用torch.compile加速（0=否，1=是）")
     parser.add_argument('--model_type', default='minimind', type=str, choices=['minimind', 'dsv4_mini'], help="模型类型")
-    parser.add_argument('--attn_chunk_size', default=0, type=int, help="dsv4_mini 稀疏注意力 Q 分块大小 (0=不分块, 走原版最快; 长上下文时设 1024/2048)")
+    parser.add_argument('--attn_chunk_size', default=0, type=int, help="dsv4_mini HCA 训练 chunk 大小 (0=自动使用window_size; 长上下文可显式设1024/2048)")
     parser.add_argument('--ce_chunk_size', default=0, type=int, help="dsv4_mini 交叉熵 seqlen 分块大小 (0=不分块, 走原版; 长上下文时设 1024/2048)")
     args = parser.parse_args()
 
@@ -118,24 +118,7 @@ if __name__ == "__main__":
     # ========== 2. 配置目录、模型参数、检查ckp ==========
     os.makedirs(args.save_dir, exist_ok=True)
     if args.model_type == 'dsv4_mini':
-        from model.model_dsv4_mini import DeepSeekV4MiniConfig
-        
-        # 动态缩放一些关键参数以适配小显存
-        is_micro = args.hidden_size < 768
-        lm_config = DeepSeekV4MiniConfig(
-            hidden_size=args.hidden_size, 
-            num_hidden_layers=args.num_hidden_layers,
-            num_attention_heads=args.hidden_size // 128 if args.hidden_size % 128 == 0 else 4,
-            moe_inter_dim=args.hidden_size,
-            q_lora_rank=(args.hidden_size // 3 // 16 * 16) if is_micro else 256,
-            o_lora_rank=(args.hidden_size // 3 // 16 * 16) if is_micro else 256,
-            num_routed_experts=8 if is_micro else 16,
-            hc_mult=2 if is_micro else 4,
-            n_mtp_layers=0,
-            max_seq_len=args.max_seq_len,
-            attn_chunk_size=args.attn_chunk_size if args.attn_chunk_size > 0 else None,
-            ce_chunk_size=args.ce_chunk_size if args.ce_chunk_size > 0 else None,
-        )
+        lm_config = build_dsv4_mini_config(args)
     else:
         lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe))
     ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume==1 else None
