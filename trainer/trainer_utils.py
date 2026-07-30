@@ -86,8 +86,6 @@ def build_dsv4_mini_config(args, inference: bool = False):
         num_hidden_layers=args.num_hidden_layers,
         num_attention_heads=args.hidden_size // 128 if args.hidden_size % 128 == 0 else 4,
         moe_inter_dim=math.ceil(args.hidden_size * math.pi / 64) * 64,
-        q_lora_rank=(args.hidden_size // 3 // 16 * 16) if is_micro else 256,
-        o_lora_rank=(args.hidden_size // 3 // 16 * 16) if is_micro else 256,
         num_routed_experts=1,
         num_shared_experts=0,
         max_seq_len=max_seq_len,

@@ -351,26 +351,19 @@ class Attention(nn.Module):
         self.layer_id = layer_id
         self.dim = config.hidden_size
         self.n_heads = config.num_attention_heads
-        self.q_lora_rank = config.q_lora_rank
-        self.o_lora_rank = config.o_lora_rank
         self.head_dim = config.head_dim
         self.rope_head_dim = config.rope_head_dim
-        self.n_groups = config.o_groups
         self.window_size = config.window_size
         self.compress_ratio = config.compress_ratios[layer_id] if layer_id < len(config.compress_ratios) else 0
         self.eps = config.norm_eps
         self.attn_chunk_size = config.attn_chunk_size
 
-        self.wq_a = nn.Linear(self.dim, self.q_lora_rank, bias=False)
-        self.q_norm = RMSNorm(self.q_lora_rank, self.eps)
-        self.wq_b = nn.Linear(self.q_lora_rank, self.n_heads * self.head_dim, bias=False)
+        self.q_proj = nn.Linear(self.dim, self.n_heads * self.head_dim, bias=False)
         self.wkv = nn.Linear(self.dim, self.head_dim, bias=False)
         self.kv_norm = RMSNorm(self.head_dim, self.eps)
         self.comp_gate = nn.Linear(self.dim, self.n_heads, bias=True)
         self.comp_gate._is_hca_comp_gate = True
-        
-        self.wo_a = nn.Linear(self.n_heads * self.head_dim // self.n_groups, self.n_groups * self.o_lora_rank, bias=False)
-        self.wo_b = nn.Linear(self.n_groups * self.o_lora_rank, self.dim, bias=False)
+        self.o_proj = nn.Linear(self.n_heads * self.head_dim, self.dim, bias=False)
         self.softmax_scale = self.head_dim ** -0.5
 
         if self.compress_ratio:
@@ -482,8 +475,7 @@ class Attention(nn.Module):
         win = self.window_size
         rd = self.rope_head_dim
 
-        q = self.q_norm(self.wq_a(x))
-        q = self.wq_b(q).unflatten(-1, (self.n_heads, self.head_dim))
+        q = self.q_proj(x).unflatten(-1, (self.n_heads, self.head_dim))
         q = F.rms_norm(q, (self.head_dim,), eps=self.eps)
         q = apply_rope_tail(q, freqs_cis, rd)
 
@@ -519,12 +511,7 @@ class Attention(nn.Module):
                 o = o + gate * o_comp
             
         o = apply_rope_tail(o, freqs_cis, rd, inverse=True)
-
-        o = o.reshape(bsz, seqlen, self.n_groups, -1)
-        wo_a = self.wo_a.weight.view(self.n_groups, self.o_lora_rank, -1)
-        o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
-        x = self.wo_b(o.flatten(2))
-        return x
+        return self.o_proj(o.reshape(bsz, seqlen, -1))
 
 
 class Gate(nn.Module):
