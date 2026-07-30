@@ -128,11 +128,8 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim, dtype=torch.float32))
 
     def forward(self, x: torch.Tensor):
-        dtype = x.dtype
-        x = x.float()
-        var = x.square().mean(-1, keepdim=True)
-        x = x * torch.rsqrt(var + self.eps)
-        return (self.weight * x).to(dtype)
+        weight = self.weight if self.weight.dtype == x.dtype else self.weight.to(dtype=x.dtype)
+        return F.rms_norm(x, (x.size(-1),), weight, self.eps)
 
 
 @lru_cache(2)
@@ -420,8 +417,7 @@ class Attention(nn.Module):
         cache = self.kv_cache[:bsz]
         if start_pos < win:
             return cache[:, : start_pos + 1]
-        pos = start_pos % win
-        return torch.cat([cache[:, pos + 1 :], cache[:, : pos + 1]], dim=1)
+        return cache
 
     def _raw_sliding_sdpa(self, q: torch.Tensor, kv: torch.Tensor, start_pos: int) -> torch.Tensor:
         bsz, seqlen, _, _ = q.shape
@@ -910,8 +906,7 @@ class DeepSeekV4MiniForCausalLM(PreTrainedModel, GenerationMixin):
         'ape',
         'kv_state', 'score_state',
     )
-    # Leaf module names whose `.weight` must stay fp32 (RMSNorm family).
-    _FP32_NORM_MODULES = ('norm', 'attn_norm', 'ffn_norm', 'q_norm', 'kv_norm', 'enorm', 'hnorm')
+    _FP32_NORM_MODULES = ()
 
     def to_inference_dtype(self, dtype=torch.bfloat16):
         """Cast the model to `dtype` (default bf16) for fast inference, but preserve
