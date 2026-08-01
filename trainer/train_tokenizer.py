@@ -2,29 +2,176 @@
 # Note: It is not recommended to re-train the tokenizer. MiniMind already includes one. This script is for learning and reference only. Training models with different tokenizers will lead to inconsistent outputs and reduce model reusability in the community.
 import os
 import json
+import glob
+import gc
+import numpy as np
+import pyarrow.compute as pc
+import pyarrow.dataset as pds
 from tokenizers import decoders, models, pre_tokenizers, trainers, Tokenizer
 
-DATA_PATH = '../dataset/pretrain_t2t_mini.jsonl'
+DATA_DIR = r'Y:\AI\Pretrain'  # 读取该目录下所有 parquet 文件
 TOKENIZER_DIR = '../model_learn_tokenizer/'
 VOCAB_SIZE = 32000
 SPECIAL_TOKENS_NUM = 36
+TARGET_CHARS = 1_000_000_000  # 目标训练语料总字符数（约 1GB 文本），据此反推采样率
+BATCH_SIZE = 1000  # 流式读取批次行数，控制内存峰值
+SEED = 42  # 随机种子，保证抽样结果可复现
+MAX_SEQ_CHARS = 5000  # 单条文本最多送入训练器的字符数。超长文本命中后随机截取一段该长度的
+                       # 连续窗口（原文每个字节都有被采样的机会），既避免巨文本单序列在 BPE
+                       # 预分词阶段内存爆炸，也让长/短文本贡献的采样长度相当
+FILE_RATE_MULTIPLIERS = {'minimind_pretrain.parquet': 0.03}  # 指定文件的采样倍率（相对正常 rate），
+                                                             # 用于给海量短文本文件（如 minimind_pretrain）降权
 
-def get_texts(data_path):
-    with open(data_path, 'r', encoding='utf-8', errors='ignore') as f:
-        for i, line in enumerate(f):
-            if i >= 10000: break # 选10000行测试
-            try:
-                data = json.loads(line)
-                # contents = [item.get('content') for item in data.get('conversations', []) if item.get('content')]
-                # if contents:
-                #     yield "\n".join(contents)
-                text = data.get('text', '')
-                if text:
-                    yield text
-            except json.JSONDecodeError:
-                continue
+def _find_files(data_dir):
+    files = sorted(glob.glob(os.path.join(data_dir, '**', '*.parquet'), recursive=True))
+    if not files:
+        raise FileNotFoundError(f'目录 {data_dir} 下未找到任何 parquet 文件')
+    return files
 
-def train_tokenizer(data_path, tokenizer_dir, vocab_size, special_tokens_num=SPECIAL_TOKENS_NUM):
+def _read_batches(f, batch_size):
+    """按 row group 流式产出 text 列批次。
+
+    用 pyarrow.dataset 而不是 ParquetFile.iter_batches：iter_batches 会跨行组合并
+    凑满 batch_size 行，行数少的文件会被整文件一次性读进内存（实测峰值 7GB）；
+    dataset 扫描器按行组逐个读取，内存只占一个 row group，不会 OOM。
+    """
+    ds = pds.dataset(f)
+    for batch in ds.to_batches(columns=['text'], batch_size=batch_size):
+        yield batch
+
+def collect_stats(data_dir, batch_size, max_seq_chars):
+    """第一遍流式遍历：只统计每行文本长度（不加载文本内容），按文件聚合截断后的字符量。
+
+    内存占用仅约 8 字节/行（只存长度数组），不会 OOM。返回值用于反推采样率。
+    """
+    file_capped = {}  # 文件名 -> Σ min(文本长度, max_seq_chars)
+    total_rows = 0
+    total_chars = 0
+    files = _find_files(data_dir)
+    print(f'共发现 {len(files)} 个 parquet 文件：')
+    for f in files:
+        print(' -', f)
+    for f in files:
+        print(f'统计长度: {f}')
+        name = os.path.basename(f)
+        capped = 0
+        for batch in _read_batches(f, batch_size):
+            lens = pc.fill_null(pc.utf8_length(batch['text']), -1).to_numpy(zero_copy_only=False)
+            lens = lens[lens > 0]
+            if len(lens):
+                total_rows += len(lens)
+                total_chars += int(lens.sum())
+                capped += int(np.minimum(lens, max_seq_chars).sum())
+        file_capped[name] = capped
+    print(f'总行数: {total_rows:,} | 总字符数: {total_chars:,} | 平均长度: {total_chars / max(total_rows, 1):.1f}')
+    for name, capped in file_capped.items():
+        mult = FILE_RATE_MULTIPLIERS.get(name, 1.0)
+        print(f' - {name}: 截断后 {capped:,} 字符, 倍率 {mult}')
+    return file_capped
+
+def compute_sampling_rate(file_capped, target_chars):
+    """按目标总字符数反推统一采样率：P(保留) = target_chars / Σ(倍率 × 各文件截断字符量)。
+
+    每条文本被采样到的概率相同（与长度无关）；FILE_RATE_MULTIPLIERS 指定的文件按倍率降权；
+    期望保留的总字符数 ≈ target_chars。
+    """
+    effective = 0.0
+    for name, capped in file_capped.items():
+        effective += FILE_RATE_MULTIPLIERS.get(name, 1.0) * capped
+    if effective <= 0 or target_chars >= effective:
+        return 1.0  # 目标超出总量，全部保留
+    rate = target_chars / effective
+    print(f'反推采样率: rate = {rate:.6f}（预计保留约 {min(target_chars, effective) / 1e6:.2f}M 字符）')
+    return rate
+
+def get_texts(data_dir, batch_size, rate, max_seq_chars):
+    """第二遍流式遍历：按统一概率随机抽样，命中文本逐条产出。
+
+    FILE_RATE_MULTIPLIERS 指定的文件按其倍率缩小采样概率（如 minimind_pretrain 用 rate×0.05）。
+    内存控制：
+    - 用 pyarrow 按批次流式读取，只投影 text 列，不一次性载入整个文件；
+    - 逐元素（.as_py()）取出抽样命中的文本，避免整批转成 Python 字符串造成内存尖峰；
+    - 超长文本随机截取一段 max_seq_chars 的连续窗口（而非固定取开头），使原文每个字节
+      都有被采样的机会，同时避免巨文本单序列在 BPE 预分词阶段内存爆炸。
+    """
+    rng = np.random.default_rng(SEED)
+    stats = {'rows_read': 0, 'rows_sampled': 0, 'chars': 0}
+    for f in _find_files(data_dir):
+        file_rate = rate * FILE_RATE_MULTIPLIERS.get(os.path.basename(f), 1.0)
+        print(f'开始读取: {f}（rate={file_rate:.6f}）')
+        for batch in _read_batches(f, batch_size):
+            arr = batch['text']
+            n = len(arr)
+            lens = pc.fill_null(pc.utf8_length(arr), -1).to_numpy(zero_copy_only=False)
+            valid = lens > 0
+            keep = (rng.random(n) < file_rate) & valid  # 统一概率，与文本长度无关
+            stats['rows_read'] += n
+            for i in range(n):
+                if not keep[i]:
+                    continue
+                text = arr[i].as_py()
+                if not text:
+                    continue
+                if len(text) > max_seq_chars:
+                    # 随机取一段连续窗口，让长文本的每个字节都有机会被采样到
+                    start = rng.integers(0, len(text) - max_seq_chars + 1)
+                    text = text[start:start + max_seq_chars]
+                stats['rows_sampled'] += 1
+                stats['chars'] += len(text)
+                yield text
+        print(f'完成: {f}')
+    print(f'总计读取 {stats["rows_read"]:,} 行，采样后保留 {stats["rows_sampled"]:,} 条文本，共 {stats["chars"]:,} 字符')
+
+def train_tokenizer(data_dir, tokenizer_dir, vocab_size, target_chars, batch_size,
+                    rate=None, max_seq_chars=MAX_SEQ_CHARS, special_tokens_num=SPECIAL_TOKENS_NUM):
+    """完整训练流程：第一遍统计长度 -> 反推统一采样率 -> 第二遍抽样训练。
+
+    未指定 rate 时自动按 target_chars 反推；已知采样率可传入（--rate）跳过第一遍统计。
+    内存不足时自动降低数据量重试。
+    """
+    if rate is None:
+        file_capped = collect_stats(data_dir, batch_size, max_seq_chars)  # 第一遍：统计文本长度（按文件聚合）
+
+    def reduce_data(msg):
+        """内存不足时降低数据量：给定 rate 则减半 rate，否则减半目标字符数。"""
+        nonlocal rate, target_chars
+        if rate is not None:
+            if rate < 1e-7:
+                return False
+            rate /= 2
+            print(f'[警告] {msg}，采样率降至 {rate:.6f} 后重试')
+        else:
+            if target_chars < 1_000_000:
+                return False
+            target_chars //= 2
+            print(f'[警告] {msg}，目标总字符数降至 {target_chars / 1e6:.0f}M 后重试')
+        gc.collect()
+        return True
+
+    while True:
+        try:
+            if rate is None:
+                rate = compute_sampling_rate(file_capped, target_chars)  # 反推采样率
+            else:
+                print(f'跳过统计：使用给定采样率 rate={rate:.6f}')
+            _train_once(data_dir, tokenizer_dir, vocab_size, rate, batch_size, max_seq_chars, special_tokens_num)
+            return
+        except KeyboardInterrupt:
+            raise
+        except MemoryError:
+            if not reduce_data('内存不足'):
+                raise
+        except BaseException as e:
+            # tokenizers(Rust) 内存分配失败会直接 panic（PanicException 继承自 BaseException，
+            # 不会抛 Python 的 MemoryError），同样按内存不足处理
+            if 'memory' not in str(e).lower():
+                raise
+            del e  # 释放异常 traceback 对失败帧（tokenizer/trainer 等 Rust 大对象）的引用，
+                   # 否则重试期间旧内存一直不释放，导致反复 OOM
+            if not reduce_data('tokenizer 内存分配失败'):
+                raise
+
+def _train_once(data_dir, tokenizer_dir, vocab_size, rate, batch_size, max_seq_chars, special_tokens_num):
     tokenizer = Tokenizer(models.BPE())
     tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
     
@@ -49,7 +196,7 @@ def train_tokenizer(data_path, tokenizer_dir, vocab_size, special_tokens_num=SPE
         initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
         special_tokens=all_special_tokens
     )
-    texts = get_texts(data_path)
+    texts = get_texts(data_dir, batch_size, rate, max_seq_chars)  # 第二遍：流式抽样训练
     tokenizer.train_from_iterator(texts, trainer=trainer)
     tokenizer.decoder = decoders.ByteLevel()
     tokenizer.add_special_tokens(special_tokens_list)
@@ -116,7 +263,10 @@ def eval_tokenizer(tokenizer_dir):
         {"role": "user", "content": '你来自哪里？'},
         {"role": "assistant", "content": '我来自月球'},
         {"role": "user", "content": '你到底来自哪里？'},
-        {"role": "assistant", "content": '我来自地球'}
+        {"role": "assistant", "content": '我来自地球'},
+        {"role": "assistant", "content": '「只看到坠毁的敌军部队烧成一团大火，尸体根本看不出是几岁。厉害的飞机变成散落四处的碎片，被压毁的民宅也是支离破碎，根本不知道死者是大人还是小孩，每个人都像木炭人偶般在地上滚来滚去。」看起来像是木炭人偶的物体不断干烧，淡淡的烟雾渗透到空气中，被烟雾迷蒙的双眼掉下眼泪。'},
+        {"role": "user", "content": '今やかつての浮航都市(フローティング・シティ)群も土台となる岩礁に癒着されて動けない単なる辺境の孤島と化してしまっていた。'},
+        
     ]
     new_prompt = tokenizer.apply_chat_template(
         messages,
@@ -140,7 +290,7 @@ def eval_tokenizer(tokenizer_dir):
         "Large language models (LLMs) are a type of artificial intelligence (AI) trained on vast amounts of text data to understand and generate human-like language. These models use deep learning techniques, specifically transformers, to process and predict the next word in a sequence. LLMs like GPT-4, Llama, and Claude have demonstrated remarkable capabilities in coding, translation, and creative writing. However, they also face challenges such as hallucinations, where the model generates factually incorrect information, and the need for significant computational resources.",
         "The development of sustainable energy is crucial for the future of our planet. As climate change continues to impact global weather patterns, transitioning from fossil fuels to renewable sources like solar, wind, and hydroelectric power has become an urgent priority. Innovations in battery storage technology and smart grid management are essential to ensure a reliable energy supply. International cooperation and policy frameworks are also necessary to drive the global shift towards a greener economy and reduce carbon emissions.",
         # 混合样本
-        "Python 是一种高级编程语言，以其简洁的语法和强大的生态系统而闻名。It is widely used in data science, machine learning, and web development. 开发者可以利用 NumPy, Pandas, and PyTorch 等库快速构建复杂的应用。学习 Python 的过程非常愉快，因为它的代码读起来就像英语一样。Whether you are a beginner or an expert, Python offers something for everyone.",
+        "Python 是一种高级编程语言，以其简洁的语法和强大的生态系统而闻名。It is widely used in data science, machine learning, and web development. 开发者可以利用 NumPy, Pandas, and PyTorch 等库快速构建复杂的应用。学习 Python 的过程非常愉快，因为它的代码读起来就像英语一样。Whether you are a beginner or an expert, Python offers something for everyone.",        
     ]
     
     total_compression = 0
@@ -167,5 +317,15 @@ def eval_tokenizer(tokenizer_dir):
             token_cache = []
 
 if __name__ == '__main__':
-    train_tokenizer(DATA_PATH, TOKENIZER_DIR, VOCAB_SIZE)
+    import argparse
+    parser = argparse.ArgumentParser(description='训练 MiniMind BPE tokenizer')
+    parser.add_argument('--rate', type=float, default=0.3,
+                        help='直接指定采样率并跳过第一遍统计（未指定时按 --target-chars 自动反推）')
+    parser.add_argument('--target-chars', type=int, default=TARGET_CHARS,
+                        help=f'目标总字符数（默认 {TARGET_CHARS}），仅在未指定 --rate 时使用')
+    parser.add_argument('--max-seq-chars', type=int, default=MAX_SEQ_CHARS,
+                        help=f'单条文本截断长度（默认 {MAX_SEQ_CHARS}）：长文本命中后只取前 N 字符')
+    args = parser.parse_args()
+    #train_tokenizer(DATA_DIR, TOKENIZER_DIR, VOCAB_SIZE, args.target_chars, BATCH_SIZE,
+    #                rate=args.rate, max_seq_chars=args.max_seq_chars)
     eval_tokenizer(TOKENIZER_DIR)
