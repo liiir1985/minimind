@@ -78,6 +78,19 @@ def _tokenize_batch(texts: list):
     return _WORKER_TOK(texts, add_special_tokens=False)["input_ids"]
 
 
+def char_split(texts: list, char_limit: int):
+    """按累计字符数把一个大 batch 切成多个子 batch, 防止超长文本堆积撑爆内存"""
+    sub, chars = [], 0
+    for t in texts:
+        if sub and chars + len(t) > char_limit:
+            yield sub
+            sub, chars = [], 0
+        sub.append(t)
+        chars += len(t)
+    if sub:
+        yield sub
+
+
 # ---------------------------------------------------------------- packer ----
 
 class BinPacker:
@@ -213,9 +226,10 @@ def parse_args():
     p.add_argument("--max-file-size", type=str, default="4GiB", help="单输出文件逻辑大小上限 (默认 4GiB)")
     p.add_argument("--mem-budget", type=str, default="200M", help="待打包序列 token 总量预算 (默认 200M token)")
     p.add_argument("--max-open-bins", type=int, default=4096, help="活跃 bin 池上限 (默认 4096)")
-    p.add_argument("--flush-rows", type=int, default=100000, help="写入缓冲行数, 攒够写一个 row group (默认 100000)")
+    p.add_argument("--flush-rows", type=int, default=0, help="写入缓冲行数, 攒够写一个 row group (默认 0=自动, 按 max-length 控制缓冲约 256MB)")
     p.add_argument("--batch-size", type=int, default=8192, help="读取输入 parquet 的 batch 行数 (默认 8192)")
-    p.add_argument("--num-workers", type=int, default=1, help="tokenize 并行进程数 (默认 1。本机单核, 多进程无收益反而更慢; 多核机器可调大)")
+    p.add_argument("--max-batch-chars", type=str, default="20M", help="单个 tokenize 任务的最大字符数, 超长文本自动拆分 (默认 20M)")
+    p.add_argument("--num-workers", type=int, default=1, help="tokenize 并行进程数 (默认 1。单核机器多进程无收益反而更慢; 多核机器可调大)")
     p.add_argument("--resume", action="store_true", help="断点续跑 (输出目录 state.json)")
     return p.parse_args()
 
@@ -272,6 +286,7 @@ def main():
     args = parse_args()
     max_file_size = parse_size(args.max_file_size)
     mem_budget = parse_size(args.mem_budget)
+    max_batch_chars = parse_size(args.max_batch_chars)
 
     if not os.path.isdir(args.input_dir):
         sys.exit(f"输入目录不存在: {args.input_dir}")
@@ -281,7 +296,15 @@ def main():
     bos_id = tok.bos_token_id if tok.bos_token_id is not None else 1
     eos_id = tok.eos_token_id if tok.eos_token_id is not None else 2
     pad_id = tok.pad_token_id if tok.pad_token_id is not None else 0
+    tok.model_max_length = 10**9  # 消除超长文本 tokenize 警告 (纯打包脚本, 无模型约束)
     print(f"  bos={bos_id} eos={eos_id} pad={pad_id} vocab={tok.vocab_size}")
+
+    # 写入缓冲行数: 默认按 max-length 自动, 缓冲内存控制在 ~256MB
+    if args.flush_rows > 0:
+        flush_rows = args.flush_rows
+    else:
+        flush_rows = max(1024, (256 << 20) // (args.max_length * 4))
+        print(f"  flush-rows 自动 = {flush_rows:,} (缓冲约 {flush_rows * args.max_length * 4 / 2**20:.0f} MB)")
 
     files = find_parquet_files(args.input_dir)
     if not files:
@@ -334,28 +357,41 @@ def main():
 
     def flush_writer_buf():
         nonlocal total_packed
-        if len(packer.finalized) >= args.flush_rows:
+        if len(packer.finalized) >= flush_rows:
             writer.write(packer.finalized)
             total_packed += len(packer.finalized)
             packer.finalized.clear()
 
     def process_ids(ids):
-        """单条文本的 input_ids -> 加 bos/eos -> 切块 -> 进待打包队列"""
+        """单条文本的 input_ids -> 加 bos/eos -> 切块 -> 进待打包队列
+
+        超长文本 (n > max_length): 拆成多个满块, 每块单独补 eos 结尾
+        (长度 = max_length, 自然单独成 bin); 剩余不足 max_length 的
+        尾巴块 (含原有 eos) 参与和其他文本拼接。
+        """
         nonlocal pending, pending_tokens, total_texts, total_raw_tokens
         toks = [bos_id] + ids + [eos_id]
         n = len(toks)
         total_raw_tokens += n
         total_texts += 1
         if n > args.max_length:
-            # 与原版一致: stride = max_length 切块, 每块独立参与打包
-            for i in range(0, n, args.max_length):
-                chunk = toks[i:i + args.max_length]
+            i = 0
+            while n - i > args.max_length:
+                chunk = toks[i:i + args.max_length - 1] + [eos_id]
                 arr = np.asarray(chunk, dtype=np.uint32)
                 pending.append(arr)
                 pending_tokens += len(arr)
+                i += args.max_length - 1
                 if pending_tokens >= mem_budget:
                     flush_pending()
                     flush_writer_buf()
+            chunk = toks[i:]
+            arr = np.asarray(chunk, dtype=np.uint32)
+            pending.append(arr)
+            pending_tokens += len(chunk)
+            if pending_tokens >= mem_budget:
+                flush_pending()
+                flush_writer_buf()
         else:
             arr = np.asarray(toks, dtype=np.uint32)
             pending.append(arr)
@@ -373,23 +409,25 @@ def main():
         pbar = tqdm(total=nrows, desc=f"[{fi}/{len(files)}] {fname}", unit="row",
                     leave=False, dynamic_ncols=True)
 
+        def row_batches():
+            # 每个 pyarrow 行 batch -> 按字符数切成子 batch, 防超长文本堆积
+            for b in pf.iter_batches(batch_size=args.batch_size, columns=[args.text_column]):
+                texts = [str(t) for t in b.column(args.text_column).to_pylist()]
+                for sub in char_split(texts, max_batch_chars):
+                    yield sub
+
         if pool is not None:
             # 并行路径: 主进程读 parquet, worker 池 tokenize (imap 保持顺序、流水线)
-            batch_iter = (
-                [str(t) for t in b.column(args.text_column).to_pylist()]
-                for b in pf.iter_batches(batch_size=args.batch_size, columns=[args.text_column])
-            )
-            for ids_list in pool.imap(_tokenize_batch, batch_iter, chunksize=1):
+            for ids_list in pool.imap(_tokenize_batch, row_batches(), chunksize=1):
                 for ids in ids_list:
                     process_ids(ids)
                 pbar.update(len(ids_list))
         else:
-            for batch in pf.iter_batches(batch_size=args.batch_size, columns=[args.text_column]):
-                texts = [str(t) for t in batch.column(args.text_column).to_pylist()]
-                enc = tok(texts, add_special_tokens=False)
+            for sub in row_batches():
+                enc = tok(sub, add_special_tokens=False)
                 for ids in enc["input_ids"]:
                     process_ids(ids)
-                pbar.update(len(texts))
+                pbar.update(len(sub))
         pbar.close()
 
         # 该文件处理完: 清空待打包队列, 强制把 finalized 缓冲落盘, 更新 state
