@@ -1,0 +1,5 @@
+{
+  "Harem*.parquet": 16,
+  "Galgame*.parquet": 32,
+  "*": 8192
+}
