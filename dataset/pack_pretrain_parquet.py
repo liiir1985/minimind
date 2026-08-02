@@ -97,6 +97,22 @@ def char_split(texts: list, char_limit: int):
         yield sub
 
 
+def split_long_texts(texts: list, seg_chars: int):
+    """单条超长文本按字符数切成多段, 每段独立 tokenize/打包
+
+    tokenizer 一次性处理超大文本时内存可能非线性暴涨 (Rust 内部结构),
+    分段后无论单行多大, tokenizer 只碰 <= seg_chars 字符的输入。
+    每段作为独立序列参与打包 (各自带 bos/eos), 预训练场景标准做法。
+    """
+    for t in texts:
+        n = len(t)
+        if n > seg_chars:
+            for i in range(0, n, seg_chars):
+                yield t[i:i + seg_chars]
+        else:
+            yield t
+
+
 # ---------------------------------------------------------------- packer ----
 
 class BinPacker:
@@ -235,6 +251,7 @@ def parse_args():
     p.add_argument("--flush-rows", type=int, default=0, help="写入缓冲行数, 攒够写一个 row group (默认 0=自动, 按 max-length 控制缓冲约 256MB)")
     p.add_argument("--batch-size", type=int, default=8192, help="读取输入 parquet 的 batch 行数 (默认 8192)")
     p.add_argument("--max-batch-chars", type=str, default="10M", help="单个 tokenize 任务的最大字符数, 超长文本自动拆分 (默认 10M)")
+    p.add_argument("--max-text-chars", type=str, default="1M", help="单条文本超过此字符数先切段再 tokenize, 防 tokenizer 内存暴涨 (默认 1M)")
     p.add_argument("--num-workers", type=int, default=1, help="tokenize 并行进程数 (默认 1。单核机器多进程无收益反而更慢; 多核机器可调大)")
     p.add_argument("--resume", action="store_true", help="断点续跑 (输出目录 state.json)")
     return p.parse_args()
@@ -293,6 +310,7 @@ def main():
     max_file_size = parse_size(args.max_file_size)
     mem_budget = parse_size(args.mem_budget)
     max_batch_chars = parse_size(args.max_batch_chars)
+    max_text_chars = parse_size(args.max_text_chars)
 
     if not os.path.isdir(args.input_dir):
         sys.exit(f"输入目录不存在: {args.input_dir}")
@@ -423,10 +441,10 @@ def main():
                     leave=False, dynamic_ncols=True)
 
         def row_batches():
-            # 每个 pyarrow 行 batch -> 按字符数切成子 batch, 防超长文本堆积
+            # 先按单条切段 (防 tokenizer 内存暴涨), 再按累计字符数切子 batch (防结果堆积)
             for b in pf.iter_batches(batch_size=args.batch_size, columns=[args.text_column]):
                 texts = [str(t) for t in b.column(args.text_column).to_pylist()]
-                for sub in char_split(texts, max_batch_chars):
+                for sub in char_split(split_long_texts(texts, max_text_chars), max_batch_chars):
                     yield sub
 
         if pool is not None:
