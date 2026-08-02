@@ -249,7 +249,9 @@ def parse_args():
     p.add_argument("--mem-budget", type=str, default="200M", help="待打包序列 token 总量预算 (默认 200M token)")
     p.add_argument("--max-open-bins", type=int, default=4096, help="活跃 bin 池上限 (默认 4096)")
     p.add_argument("--flush-rows", type=int, default=0, help="写入缓冲行数, 攒够写一个 row group (默认 0=自动, 按 max-length 控制缓冲约 256MB)")
-    p.add_argument("--batch-size", type=int, default=8192, help="读取输入 parquet 的 batch 行数 (默认 8192)")
+    p.add_argument("--batch-size", type=int, default=16,
+                   help="读取输入 parquet 的 batch 行数 (默认 16)。pyarrow 按此大小流式解压, 越小峰值内存越低; "
+                        "超大文本行文件 (每行整本书) 必须小, 8192 会把整列一次解压进内存直接 OOM")
     p.add_argument("--max-batch-chars", type=str, default="10M", help="单个 tokenize 任务的最大字符数, 超长文本自动拆分 (默认 10M)")
     p.add_argument("--max-text-chars", type=str, default="1M", help="单条文本超过此字符数先切段再 tokenize, 防 tokenizer 内存暴涨 (默认 1M)")
     p.add_argument("--num-workers", type=int, default=1, help="tokenize 并行进程数 (默认 1。单核机器多进程无收益反而更慢; 多核机器可调大)")
