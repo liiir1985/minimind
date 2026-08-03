@@ -187,9 +187,16 @@ if __name__ == "__main__":
         model = DistributedDataParallel(model, device_ids=[local_rank])
     
     # ========== 8. 开始训练 ==========
+    is_packed = isinstance(train_ds, PackedPretrainDataset)
     for epoch in range(start_epoch, args.epochs):
         train_sampler and train_sampler.set_epoch(epoch)
-        setup_seed(42 + epoch); indices = torch.randperm(len(train_ds)).tolist()
+        setup_seed(42 + epoch)
+        if is_packed:
+            # packed parquet: 按 row_group 聚簇 shuffle, 避免 DataLoader worker
+            # 随机 index 打散 row_group 命中, 每次 __getitem__ 都解压 256MB
+            indices = train_ds.rowgroup_shuffled_indices(seed=42 + epoch).tolist()
+        else:
+            indices = torch.randperm(len(train_ds)).tolist()
         skip = start_step if (epoch == start_epoch and start_step > 0) else 0
         batch_sampler = SkipBatchSampler(train_sampler or indices, args.batch_size, skip)
         loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True)

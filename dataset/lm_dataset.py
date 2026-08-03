@@ -228,6 +228,32 @@ class PackedPretrainDataset(Dataset):
     def __len__(self):
         return self.total_rows
 
+    def rowgroup_shuffled_indices(self, seed):
+        """返回按 row_group 聚簇 shuffle 的全局 index 序列
+
+        随机打乱 (file, rg) 顺序 + 每个 rg 内部行随机打乱, 保证:
+          - 每个 rg 只解压一次即可服务全部内部行 (LRU 命中率 ~100%)
+          - 训练随机性仍充足 (rg 间乱序 + rg 内乱序, 只有跨 rg 的联合分布受限)
+
+        seed 需与 DistributedSampler 保持一致 (通常 = base_seed + epoch)。
+        """
+        g = np.random.default_rng(seed)
+        rg_list = []
+        for fi, cum in enumerate(self.file_rg_cumrows):
+            base = self.file_cumrows[fi]
+            for rg in range(len(cum) - 1):
+                rg_list.append((base + cum[rg], base + cum[rg + 1]))
+        g.shuffle(rg_list)
+        out = np.empty(self.total_rows, dtype=np.int64)
+        pos = 0
+        for lo, hi in rg_list:
+            n = hi - lo
+            rows = np.arange(lo, hi, dtype=np.int64)
+            g.shuffle(rows)
+            out[pos:pos + n] = rows
+            pos += n
+        return out
+
     def _get_row_group(self, file_idx, rg_idx):
         key = (file_idx, rg_idx)
         cached = self._rg_cache.get(key)
