@@ -242,7 +242,10 @@ class PackedPretrainDataset(Dataset):
 
         table = pf.read_row_group(rg_idx, columns=["input_ids"])
         arr = table.column("input_ids")
-        # FixedSizeListArray -> (num_rows, max_length) int32
+        # ChunkedArray -> 单一 FixedSizeListArray; row_group 通常单 chunk,
+        # combine_chunks 在此情况下零拷贝
+        if hasattr(arr, "combine_chunks"):
+            arr = arr.combine_chunks()
         values = arr.values.to_numpy(zero_copy_only=True)
         block = values.reshape(-1, self.max_length)
 
