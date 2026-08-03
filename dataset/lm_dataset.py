@@ -2,6 +2,8 @@ from torch.utils.data import Dataset
 import torch
 import json
 import os
+import re
+import bisect
 import random
 from datasets import load_dataset, Features, Sequence, Value
 import numpy as np
@@ -149,6 +151,133 @@ class PretrainDataset(Dataset):
         labels = input_ids.clone()
         labels[input_ids == self.tokenizer.pad_token_id] = -100
         return input_ids, labels
+
+
+class PackedPretrainDataset(Dataset):
+    """读取 pack_pretrain_parquet.py 生成的 packed parquet 目录
+
+    - 只在初始化时读每个 part-*.parquet 的 metadata (行数 + schema),
+      不加载 input_ids 数据本体
+    - __getitem__ 时按 (file_idx, row_group_idx) 惰性读取 row group,
+      读进来的 block 缓存以服务同 rg 内后续 __getitem__ (顺序 / 按 rg 聚簇
+      shuffle 时命中率 ~100%; 全局 shuffle 时命中率 ~0, 可将
+      cache_row_groups 设为 0 关掉)
+    - schema 校验 input_ids 是 fixed_size_list<int32>[max_length],
+      与传入的 max_length 一致
+    """
+
+    _PART_RE = re.compile(r"part-(\d{5})\.parquet$")
+
+    def __init__(self, data_dir, tokenizer, max_length, cache_row_groups=2):
+        super().__init__()
+        import pyarrow.parquet as pq
+
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.pad_token_id = tokenizer.pad_token_id
+        self.cache_row_groups = cache_row_groups
+
+        if not os.path.isdir(data_dir):
+            raise FileNotFoundError(f"packed parquet 目录不存在: {data_dir}")
+
+        files = []
+        for fn in os.listdir(data_dir):
+            m = self._PART_RE.search(fn)
+            if m:
+                files.append((int(m.group(1)), os.path.join(data_dir, fn)))
+        if not files:
+            raise FileNotFoundError(f"目录下没有 part-*.parquet: {data_dir}")
+        files.sort()
+        self.files = [p for _, p in files]
+
+        # 只读元数据 (num_rows / schema / row_group 行数), 不加载 input_ids
+        self.file_rows = []            # 每个文件的总行数
+        self.file_rg_cumrows = []      # 每个文件: [rg_i 之前累计行数], 用于二分查找 rg
+        self.file_num_row_groups = []
+        for fp in self.files:
+            pf = pq.ParquetFile(fp)
+            schema = pf.schema_arrow
+            if "input_ids" not in schema.names:
+                raise ValueError(f"{fp} 缺少 input_ids 列, 实际列: {schema.names}")
+            field = schema.field("input_ids")
+            t = field.type
+            if not (pa_is_fixed_size_list(t) and t.list_size == max_length):
+                raise ValueError(
+                    f"{fp}: input_ids 类型不匹配, 期望 fixed_size_list<int32>[{max_length}], "
+                    f"实际 {t}")
+            nrg = pf.metadata.num_row_groups
+            cum = [0] * (nrg + 1)
+            for i in range(nrg):
+                cum[i + 1] = cum[i] + pf.metadata.row_group(i).num_rows
+            self.file_rows.append(cum[-1])
+            self.file_rg_cumrows.append(cum)
+            self.file_num_row_groups.append(nrg)
+
+        # 全局行 -> 文件二分
+        self.file_cumrows = [0]
+        for n in self.file_rows:
+            self.file_cumrows.append(self.file_cumrows[-1] + n)
+        self.total_rows = self.file_cumrows[-1]
+
+        # 惰性状态: ParquetFile 句柄 + row group 缓存 (每 worker 独立创建)
+        # DataLoader num_workers > 0 时进程内独占, 无需锁
+        self._pf_cache = {}            # file_idx -> ParquetFile
+        self._rg_cache = {}            # (file_idx, rg_idx) -> np.ndarray[num_rows, max_length]
+        self._rg_lru = []              # 顺序记录, 超过 cache_row_groups 时淘汰最早
+
+    def __len__(self):
+        return self.total_rows
+
+    def _get_row_group(self, file_idx, rg_idx):
+        key = (file_idx, rg_idx)
+        cached = self._rg_cache.get(key)
+        if cached is not None:
+            return cached
+
+        import pyarrow.parquet as pq
+        pf = self._pf_cache.get(file_idx)
+        if pf is None:
+            pf = pq.ParquetFile(self.files[file_idx])
+            self._pf_cache[file_idx] = pf
+
+        table = pf.read_row_group(rg_idx, columns=["input_ids"])
+        arr = table.column("input_ids")
+        # FixedSizeListArray -> (num_rows, max_length) int32
+        values = arr.values.to_numpy(zero_copy_only=True)
+        block = values.reshape(-1, self.max_length)
+
+        self._rg_cache[key] = block
+        self._rg_lru.append(key)
+        while len(self._rg_lru) > self.cache_row_groups:
+            old = self._rg_lru.pop(0)
+            self._rg_cache.pop(old, None)
+        return block
+
+    def __getitem__(self, index):
+        if index < 0:
+            index += self.total_rows
+        if index < 0 or index >= self.total_rows:
+            raise IndexError(index)
+
+        file_idx = bisect.bisect_right(self.file_cumrows, index) - 1
+        local = index - self.file_cumrows[file_idx]
+        cum = self.file_rg_cumrows[file_idx]
+        rg_idx = bisect.bisect_right(cum, local) - 1
+        row_in_rg = local - cum[rg_idx]
+
+        block = self._get_row_group(file_idx, rg_idx)
+        row = block[row_in_rg]
+
+        input_ids = torch.from_numpy(row.astype(np.int64, copy=True))
+        labels = input_ids.clone()
+        if self.pad_token_id is not None:
+            labels[input_ids == self.pad_token_id] = -100
+        return input_ids, labels
+
+
+def pa_is_fixed_size_list(t):
+    import pyarrow as pa
+    return pa.types.is_fixed_size_list(t)
 
 
 class SFTDataset(Dataset):
