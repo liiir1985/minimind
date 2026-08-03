@@ -440,9 +440,9 @@ def main():
     def process_ids(ids):
         """单条文本 token 数组 (np.uint32) -> 加 bos/eos -> 切块 -> 进待打包队列
 
-        超长文本 (n > max_length): 拆成多个满块, 每块单独补 eos 结尾
-        (长度 = max_length, 自然单独成 bin); 剩余不足 max_length 的
-        尾巴块 (含原有 eos) 参与和其他文本拼接。
+        超长文本 (n > max_length): 拆成多个满块, 每块 = bos + (max_length-2) 内容
+        + eos, 每块自成完整样本 (长度 = max_length, 自然单独成 bin);
+        剩余不足的尾巴块同样 bos + 剩余内容 + eos, 参与和其他文本拼接。
         全程 numpy 操作, 避免 Python list of int 的内存膨胀。
         """
         nonlocal pending, pending_tokens, total_texts, total_raw_tokens
@@ -450,24 +450,27 @@ def main():
         total_raw_tokens += n
         total_texts += 1
         if n > args.max_length:
-            toks = np.empty(n, dtype=np.uint32)
-            toks[0] = bos_id
-            toks[1:-1] = ids
-            toks[-1] = eos_id
+            cap = args.max_length - 2  # 每块可容纳的内容 token 数
             i = 0
-            while n - i > args.max_length:
+            L = len(ids)
+            while L - i > cap:
                 chunk = np.empty(args.max_length, dtype=np.uint32)
-                chunk[:args.max_length - 1] = toks[i:i + args.max_length - 1]
+                chunk[0] = bos_id
+                chunk[1:args.max_length - 1] = ids[i:i + cap]
                 chunk[args.max_length - 1] = eos_id
                 pending.append(chunk)
                 pending_tokens += args.max_length
-                i += args.max_length - 1
+                i += cap
                 if pending_tokens >= mem_budget:
                     flush_pending()
                     flush_writer_buf()
-            chunk = toks[i:]
-            pending.append(chunk)
-            pending_tokens += len(chunk)
+            rem = L - i
+            tail = np.empty(rem + 2, dtype=np.uint32)
+            tail[0] = bos_id
+            tail[1:-1] = ids[i:]
+            tail[-1] = eos_id
+            pending.append(tail)
+            pending_tokens += rem + 2
             if pending_tokens >= mem_budget:
                 flush_pending()
                 flush_writer_buf()
