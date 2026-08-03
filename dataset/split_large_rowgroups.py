@@ -11,9 +11,10 @@ split_large_rowgroups.py — 把"存在超大 row group"的 parquet 重写为小
   重写为 ~64MB/row group 后, 逐组流式解压, 读取内存降至 1/8。
 
 判断规则 (对每个 parquet 文件):
-  - 文件所有 row group 未压缩字节总和 ≤ --threshold → 跳过 (文件太小, 不处理)
-  - 总字节 > --threshold 且任一 row group > --max-rg-size → 重写该文件
-  - 总字节 > --threshold 但所有 row group ≤ 阈值   → 跳过 (符合规则的不动)
+  - 任一 row group 未压缩字节 > --threshold → 重写该文件 (拆成 ~--max-rg-size 的 RG)
+  - 所有 row group ≤ --threshold   → 跳过 (符合规则的不动)
+  - 重写只拆 row group, 不改变文件内容与总大小; threshold 是"拆不拆"的门槛,
+    --max-rg-size 是拆的目标粒度
 
 重写方式 (字节驱动, 不做平均行大小换算):
   - iter_batches(batch_size=128) 流式读, 逐批累积字节
@@ -126,7 +127,7 @@ def main():
     ap.add_argument("--input-dir", required=True, help="输入目录, 递归扫描所有 .parquet")
     ap.add_argument("--output-dir", required=True, help="输出目录 (保持相对路径; 符合规则的文件跳过不复制)")
     ap.add_argument("--threshold", type=str, default="256M",
-                    help="文件处理门槛: 所有 RG 未压缩总字节 ≤ 此值直接跳过 (默认 256M)")
+                    help="重写门槛: 单个 row group 未压缩字节 > 此值才重写 (默认 256M)")
     ap.add_argument("--max-rg-size", type=str, default="64M",
                     help="重写目标: 单个 row group 未压缩字节上限 (默认 64M)")
     ap.add_argument("--compression", default="zstd")
@@ -155,16 +156,10 @@ def main():
         nrows = pf.metadata.num_rows
         nrg = pf.metadata.num_row_groups
         rg_sizes = [row_group_uncompressed(pf, i) for i in range(nrg)]
-        total_bytes = sum(rg_sizes)
         max_rg = max(rg_sizes) if rg_sizes else 0
 
-        if total_bytes <= threshold:
-            print(f"  [跳过] {base}: 总 {total_bytes/2**20:.0f} MB (<= 门槛 {threshold/2**20:.0f} MB), 不处理")
-            skipped += 1
-            continue
-
-        if max_rg <= rg_bytes:
-            print(f"  [跳过] {base}: {nrows} 行, {nrg} RG, 最大 {max_rg/2**20:.0f} MB (<= {rg_bytes/2**20:.0f} MB)")
+        if max_rg <= threshold:
+            print(f"  [跳过] {base}: {nrows} 行, {nrg} RG, 最大 {max_rg/2**20:.0f} MB (<= 门槛 {threshold/2**20:.0f} MB)")
             skipped += 1
             continue
 

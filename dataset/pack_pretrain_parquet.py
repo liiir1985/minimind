@@ -101,14 +101,17 @@ def _init_worker(tokenizer_dir: str):
     _WORKER_TOK.model_max_length = 10**9  # 消除超长文本 tokenize 警告
 
 
-def _tokenize_batch(texts: list):
-    """worker 进程执行: 批量 tokenize, 返回 np.uint32 数组列表 (无 special tokens)
+def _tokenize_batch(payload):
+    """worker 进程执行: 批量 tokenize, 返回 (np.uint32 数组列表, 该组行数)
 
+    payload = (texts, rows_done): texts 为子 batch 文本列表, rows_done 仅在
+    该组最后一个子 batch 非 0 (供进度条按已处理行数计数)。
     必须返回 numpy 数组: Python list of int 内存膨胀 ~7 倍,
     100 万 token 的 list 约 28MB, 会撑爆结果队列。
     """
+    texts, rows_done = payload
     enc = _WORKER_TOK(texts, add_special_tokens=False)
-    return [np.asarray(ids, dtype=np.uint32) for ids in enc["input_ids"]]
+    return [np.asarray(ids, dtype=np.uint32) for ids in enc["input_ids"]], rows_done
 
 
 def char_split(texts: list, char_limit: int):
@@ -223,7 +226,7 @@ class BinPacker:
 # ---------------------------------------------------------------- writer ----
 
 class OutputWriter:
-    """按逻辑数据量切分输出 parquet 文件, 每个 ≤ max_file_size"""
+    """按物理大小 (zstd 压缩后磁盘占用) 切分输出 parquet 文件, 每个 ≤ max_file_size"""
 
     def __init__(self, out_dir: str, max_length: int, max_file_size: int, start_idx: int = 0):
         os.makedirs(out_dir, exist_ok=True)
@@ -231,28 +234,30 @@ class OutputWriter:
         self.max_length = max_length
         self.max_file_size = max_file_size
         self.file_idx = start_idx
-        self.logical_bytes = 0
+        self.physical_bytes = 0
+        self.path = None
         self.writer = None
         self.schema = pa.schema([("input_ids", pa.list_(pa.int32(), max_length))])
-        self.row_bytes = max_length * 4  # 单列 int32
 
     def write(self, bins: list):
         """bins: list[np.ndarray (max_length,) uint32]"""
         if not bins:
             return
         if self.writer is None:
-            path = os.path.join(self.out_dir, f"part-{self.file_idx:05d}.parquet")
-            self.writer = pq.ParquetWriter(path, self.schema, compression="zstd", compression_level=9)
+            self.path = os.path.join(self.out_dir, f"part-{self.file_idx:05d}.parquet")
+            self.writer = pq.ParquetWriter(self.path, self.schema, compression="zstd", compression_level=9)
 
         values = np.stack(bins).astype(np.int32).reshape(-1)
         arr = pa.FixedSizeListArray.from_arrays(pa.array(values), self.max_length)
         self.writer.write_table(pa.table({"input_ids": arr}))
 
-        self.logical_bytes += len(bins) * self.row_bytes
-        if self.logical_bytes >= self.max_file_size:
+        # 按物理大小 (压缩后) 切文件: write_table 已把 row group 写入文件,
+        # getsize 反映当前文件实际磁盘占用
+        self.physical_bytes = os.path.getsize(self.path)
+        if self.physical_bytes >= self.max_file_size:
             self.close_current()
             self.file_idx += 1
-            self.logical_bytes = 0
+            self.physical_bytes = 0
 
     def close_current(self):
         if self.writer is not None:
@@ -272,7 +277,7 @@ def parse_args():
     p.add_argument("--tokenizer", default=DEFAULT_TOKENIZER, help=f"tokenizer 目录 (默认 {DEFAULT_TOKENIZER})")
     p.add_argument("--max-length", type=int, default=2000, help="packed 序列长度 (默认 2000, 同 train_pretrain)")
     p.add_argument("--text-column", default="text", help="输入 parquet 的文本列名 (默认 text)")
-    p.add_argument("--max-file-size", type=str, default="4GiB", help="单输出文件逻辑大小上限 (默认 4GiB)")
+    p.add_argument("--max-file-size", type=str, default="4GiB", help="单输出文件物理大小上限, 压缩后磁盘占用 (默认 4GiB)")
     p.add_argument("--mem-budget", type=str, default="200M", help="待打包序列 token 总量预算 (默认 200M token)")
     p.add_argument("--max-open-bins", type=int, default=4096, help="活跃 bin 池上限 (默认 4096)")
     p.add_argument("--flush-rows", type=int, default=0, help="写入缓冲行数, 攒够写一个 row group (默认 0=自动, 按 max-length 控制缓冲约 256MB)")
@@ -508,6 +513,8 @@ def main():
         def row_batches():
             # pyarrow 解压出的 batch 先按 UTF-8 字节预算细切片再 to_pylist:
             # 避免整批转 Python str 造成峰值 (pyarrow 数组与 str 副本同时存在)
+            # yield (sub, rows_done): rows_done 仅在该组最后一个 sub 非 0,
+            # 携带本组行数, 供进度条按已处理行数计数
             for b in pf.iter_batches(batch_size=batch_size, columns=[args.text_column]):
                 col = b.column(args.text_column)
                 n = len(col)
@@ -518,26 +525,51 @@ def main():
                     if acc >= slice_bytes and i + 1 < n:
                         texts = [str(t) for t in col.slice(start, i - start + 1).to_pylist()]
                         # 先按单条切段 (防 tokenizer 内存暴涨), 再按累计字符数切子 batch
-                        for sub in char_split(split_long_texts(texts, max_text_chars), max_batch_chars):
-                            yield sub
+                        subs = list(char_split(split_long_texts(texts, max_text_chars), max_batch_chars))
+                        for si, sub in enumerate(subs):
+                            yield (sub, len(texts) if si == len(subs) - 1 else 0)
                         start, acc = i + 1, 0
                 if start < n:
                     texts = [str(t) for t in col.slice(start, n - start).to_pylist()]
-                    for sub in char_split(split_long_texts(texts, max_text_chars), max_batch_chars):
-                        yield sub
+                    subs = list(char_split(split_long_texts(texts, max_text_chars), max_batch_chars))
+                    for si, sub in enumerate(subs):
+                        yield (sub, len(texts) if si == len(subs) - 1 else 0)
 
+        file_segments = 0
         if pool is not None:
-            # 并行路径: 主进程读 parquet, worker 池 tokenize (imap 保持顺序、流水线)
-            for ids_list in pool.imap(_tokenize_batch, row_batches(), chunksize=1):
+            # 并行路径: 主进程读 parquet, worker 池 tokenize。
+            # 不用 pool.imap: imap 的 task handler 会把输入生成器全部消费进
+            # 无界输入队列, 大文件整个文本进内存直接 OOM。
+            # 改 apply_async 固定窗口 (在途任务 <= window), 输入生成器惰性取。
+            window = max(args.num_workers * 2, 4)
+            it = row_batches()
+            inflight = []
+
+            def launch():
+                try:
+                    payload = next(it)
+                except StopIteration:
+                    return False
+                inflight.append(pool.apply_async(_tokenize_batch, (payload,)))
+                return True
+
+            for _ in range(window):
+                if not launch():
+                    break
+            while inflight:
+                ids_list, rows_done = inflight.pop(0).get()
                 for ids in ids_list:
                     process_ids(ids)
-                pbar.update(len(ids_list))
+                    file_segments += 1
+                pbar.update(rows_done)
+                launch()
         else:
-            for sub in row_batches():
+            for sub, rows_done in row_batches():
                 enc = tok(sub, add_special_tokens=False)
                 for ids in enc["input_ids"]:
                     process_ids(np.asarray(ids, dtype=np.uint32))
-                pbar.update(len(sub))
+                    file_segments += 1
+                pbar.update(rows_done)
         pbar.close()
 
         # 该文件处理完: 清空待打包队列, 强制把 finalized 缓冲落盘, 更新 state
@@ -550,6 +582,8 @@ def main():
         state["done_inputs"].append(fpath)
         state["closed_files"] = writer.file_idx
         save_state(args.output_dir, state)
+        print(f"  {fname}: {nrows:,} 行 -> 拆分 {file_segments:,} 段"
+              f" ({file_segments / max(nrows, 1):.1f} 段/行)")
 
     # 收尾: 池中所有 bin 落盘
     flush_pending()
