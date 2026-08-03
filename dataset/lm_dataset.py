@@ -228,30 +228,55 @@ class PackedPretrainDataset(Dataset):
     def __len__(self):
         return self.total_rows
 
-    def rowgroup_shuffled_indices(self, seed):
+    def rowgroup_shuffled_indices(self, seed, chunk_size=0, mix_rgs=1):
         """返回按 row_group 聚簇 shuffle 的全局 index 序列
 
-        随机打乱 (file, rg) 顺序 + 每个 rg 内部行随机打乱, 保证:
-          - 每个 rg 只解压一次即可服务全部内部行 (LRU 命中率 ~100%)
-          - 训练随机性仍充足 (rg 间乱序 + rg 内乱序, 只有跨 rg 的联合分布受限)
+        参数:
+          chunk_size: 每个 rg 内进一步切成 chunk 的行数 (0 = 不切, 整 rg 作一个 chunk)
+          mix_rgs:    同时交错的 rg 数量 (>=1); 训练时 cache_row_groups 必须 >= mix_rgs
+                      否则 LRU 会不停淘汰导致重复解压
 
-        seed 需与 DistributedSampler 保持一致 (通常 = base_seed + epoch)。
+        算法:
+          - rg 全局顺序打乱
+          - 每 mix_rgs 个 rg 组成一个 band, band 内每个 rg 切成 chunk,
+            所有 chunk 混合打乱, 但 chunk 内行保持连续 (=chunk 内也可再 shuffle)
+          - band 之间按 shuffle 后的 rg 顺序处理
+
+        效果:
+          - domain 切换粒度 = chunk_size 行 (远小于 rg 大小)
+          - cache 命中: 一个 band 内的 chunk 只在 mix_rgs 个 rg 之间跳,
+            cache_row_groups >= mix_rgs 时命中率 100%
+
+        seed 需与训练 epoch 关联 (通常 = base_seed + epoch)。
         """
         g = np.random.default_rng(seed)
-        rg_list = []
+        # 收集所有 (rg 全局起始, rg 长度)
+        rg_spans = []
         for fi, cum in enumerate(self.file_rg_cumrows):
             base = self.file_cumrows[fi]
             for rg in range(len(cum) - 1):
-                rg_list.append((base + cum[rg], base + cum[rg + 1]))
-        g.shuffle(rg_list)
+                rg_spans.append((base + cum[rg], cum[rg + 1] - cum[rg]))
+        g.shuffle(rg_spans)
+
         out = np.empty(self.total_rows, dtype=np.int64)
         pos = 0
-        for lo, hi in rg_list:
-            n = hi - lo
-            rows = np.arange(lo, hi, dtype=np.int64)
-            g.shuffle(rows)
-            out[pos:pos + n] = rows
-            pos += n
+        # 每个 band 处理 mix_rgs 个 rg
+        for band_start in range(0, len(rg_spans), max(mix_rgs, 1)):
+            band = rg_spans[band_start:band_start + max(mix_rgs, 1)]
+            # 生成 band 内所有 chunk 的 (start, length)
+            chunks = []
+            for lo, n in band:
+                if chunk_size <= 0:
+                    chunks.append((lo, n))
+                else:
+                    for c_start in range(0, n, chunk_size):
+                        chunks.append((lo + c_start, min(chunk_size, n - c_start)))
+            g.shuffle(chunks)
+            for c_lo, c_n in chunks:
+                rows = np.arange(c_lo, c_lo + c_n, dtype=np.int64)
+                g.shuffle(rows)
+                out[pos:pos + c_n] = rows
+                pos += c_n
         return out
 
     def _get_row_group(self, file_idx, rg_idx):

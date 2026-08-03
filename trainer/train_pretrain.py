@@ -130,6 +130,8 @@ if __name__ == "__main__":
     parser.add_argument('--ce_chunk_size', default=0, type=int, help="dsv4_mini 交叉熵 seqlen 分块大小 (0=不分块, 走原版; 长上下文时设 1024/2048)")
     parser.add_argument("--profile", default=0, type=int, choices=[0, 1], help="启用PyTorch Profiler，在前8个step采样并输出trace到--profile_dir（用tensorboard查看）")
     parser.add_argument("--profile_dir", default="../prof_log", type=str, help="profiler trace输出目录")
+    parser.add_argument("--packed_chunk_size", type=int, default=512, help="PackedPretrainDataset 内 chunk 打乱粒度 (行数), 越小 domain 混合越均匀 (0=按整 rg)")
+    parser.add_argument("--packed_mix_rgs", type=int, default=4, help="PackedPretrainDataset 同时交错的 row_group 数量, cache_row_groups 需 >= 此值")
     args = parser.parse_args()
 
     # ========== 1. 初始化环境和随机种子 ==========
@@ -162,8 +164,10 @@ if __name__ == "__main__":
     # ========== 5. 定义模型、数据、优化器 ==========
     model, tokenizer = init_model(lm_config, args.from_weight, device=args.device, model_type=args.model_type)
     if os.path.isdir(args.data_path):
-        train_ds = PackedPretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
-        Logger(f'使用 PackedPretrainDataset: {args.data_path} ({len(train_ds):,} 条 packed 样本)')
+        train_ds = PackedPretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len,
+                                         cache_row_groups=max(2, args.packed_mix_rgs))
+        Logger(f'使用 PackedPretrainDataset: {args.data_path} ({len(train_ds):,} 条 packed 样本), '
+               f'chunk_size={args.packed_chunk_size}, mix_rgs={args.packed_mix_rgs}')
     else:
         train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
@@ -194,7 +198,10 @@ if __name__ == "__main__":
         if is_packed:
             # packed parquet: 按 row_group 聚簇 shuffle, 避免 DataLoader worker
             # 随机 index 打散 row_group 命中, 每次 __getitem__ 都解压 256MB
-            indices = train_ds.rowgroup_shuffled_indices(seed=42 + epoch).tolist()
+            indices = train_ds.rowgroup_shuffled_indices(
+                seed=42 + epoch,
+                chunk_size=args.packed_chunk_size,
+                mix_rgs=args.packed_mix_rgs)
         else:
             indices = torch.randperm(len(train_ds)).tolist()
         skip = start_step if (epoch == start_epoch and start_step > 0) else 0
