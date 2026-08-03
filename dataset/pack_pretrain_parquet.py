@@ -43,6 +43,7 @@ os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 from tqdm import tqdm
 from transformers import AutoTokenizer
@@ -282,7 +283,14 @@ def parse_args():
     p.add_argument("--config", default=None,
                    help="batch-size 配置文件 (JSON): {文件名模式: batch_size}, 按插入顺序第一个命中生效, "
                         "\"*\" 可作兜底。例: {\"Harem*.parquet\": 16, \"*\": 8192}。"
-                        "未命中任何模式的文件用 --batch-size 默认值 (默认 16, 安全)")
+                        "未命中任何模式的文件用 --batch-size 默认值 (默认 16, 安全)。"
+                        "脚本会按文件平均行大小自动钳制过大值, 配错也不会 OOM")
+    p.add_argument("--slice-bytes", type=str, default="64M",
+                   help="to_pylist 单次切片的 UTF-8 字节预算 (默认 64M)。pyarrow 解压出的 batch 按此预算"
+                        "再细切片转 Python str, 防止整批复制造成峰值 (超大行文件必需)")
+    p.add_argument("--max-batch-mem", type=str, default="512M",
+                   help="pyarrow 单批解压内存估算上限 (默认 512M)。按文件平均行大小把 batch-size 钳制到 "
+                        "batch x 行字节 x 3 <= 此值, 防止配置值过大时读取阶段 OOM")
     p.add_argument("--max-batch-chars", type=str, default="10M", help="单个 tokenize 任务的最大字符数, 超长文本自动拆分 (默认 10M)")
     p.add_argument("--max-text-chars", type=str, default="1M", help="单条文本超过此字符数先切段再 tokenize, 防 tokenizer 内存暴涨 (默认 1M)")
     p.add_argument("--num-workers", type=int, default=1, help="tokenize 并行进程数 (默认 1。单核机器多进程无收益反而更慢; 多核机器可调大)")
@@ -344,6 +352,8 @@ def main():
     mem_budget = parse_size(args.mem_budget)
     max_batch_chars = parse_size(args.max_batch_chars)
     max_text_chars = parse_size(args.max_text_chars)
+    slice_bytes = parse_size(args.slice_bytes)
+    max_batch_mem = parse_size(args.max_batch_mem)
     batch_cfg = load_batch_config(args.config)
     if batch_cfg:
         print(f"加载 batch-size 配置: {args.config} ({len(batch_cfg)} 条模式)")
@@ -472,18 +482,49 @@ def main():
         pf = pq.ParquetFile(fpath)
         nrows = pf.metadata.num_rows
         fname = os.path.relpath(fpath, args.input_dir)
+        # 估算 text 列平均行大小 (未压缩字节数, 真实文本近似 UTF-8 大小)
+        try:
+            col_idx = pf.metadata.schema.names.index(args.text_column)
+            uncompressed = sum(
+                pf.metadata.row_group(rg).column(col_idx).total_uncompressed_size
+                for rg in range(pf.metadata.num_row_groups))
+        except ValueError:
+            sys.exit(f"列 {args.text_column} 不存在于 {fname}")
+        avg_row = uncompressed / max(nrows, 1)
+        # 配置/参数 -> batch-size; 按平均行大小钳制, 防配置过大时读取阶段 OOM
         batch_size = batch_size_for(batch_cfg, fpath, args.batch_size)
-        if batch_cfg:
-            print(f"  {fname}: batch-size = {batch_size} (配置)")
+        if avg_row > 0:
+            capped = max(1, min(batch_size, int(max_batch_mem / (avg_row * 3))))
+            if capped < batch_size:
+                print(f"  {fname}: 平均行 {avg_row/2**20:.1f} MB, 配置 batch-size {batch_size} 过大"
+                      f" (解压 ~{batch_size*avg_row*3/2**20:.0f} MB), 钳制为 {capped}")
+                batch_size = capped
+            else:
+                print(f"  {fname}: 平均行 {avg_row/2**20:.2f} MB, batch-size = {batch_size}"
+                      f" (解压 ~{batch_size*avg_row*3/2**20:.0f} MB)")
         pbar = tqdm(total=nrows, desc=f"[{fi}/{len(files)}] {fname}", unit="row",
                     leave=False, dynamic_ncols=True)
 
         def row_batches():
-            # 先按单条切段 (防 tokenizer 内存暴涨), 再按累计字符数切子 batch (防结果堆积)
+            # pyarrow 解压出的 batch 先按 UTF-8 字节预算细切片再 to_pylist:
+            # 避免整批转 Python str 造成峰值 (pyarrow 数组与 str 副本同时存在)
             for b in pf.iter_batches(batch_size=batch_size, columns=[args.text_column]):
-                texts = [str(t) for t in b.column(args.text_column).to_pylist()]
-                for sub in char_split(split_long_texts(texts, max_text_chars), max_batch_chars):
-                    yield sub
+                col = b.column(args.text_column)
+                n = len(col)
+                lens = pc.fill_null(pc.binary_length(col), 0).to_numpy(zero_copy_only=False)
+                start, acc = 0, 0
+                for i in range(n):
+                    acc += int(lens[i])
+                    if acc >= slice_bytes and i + 1 < n:
+                        texts = [str(t) for t in col.slice(start, i - start + 1).to_pylist()]
+                        # 先按单条切段 (防 tokenizer 内存暴涨), 再按累计字符数切子 batch
+                        for sub in char_split(split_long_texts(texts, max_text_chars), max_batch_chars):
+                            yield sub
+                        start, acc = i + 1, 0
+                if start < n:
+                    texts = [str(t) for t in col.slice(start, n - start).to_pylist()]
+                    for sub in char_split(split_long_texts(texts, max_text_chars), max_batch_chars):
+                        yield sub
 
         if pool is not None:
             # 并行路径: 主进程读 parquet, worker 池 tokenize (imap 保持顺序、流水线)
