@@ -258,7 +258,7 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
     
     # https://github.com/jingyaogong/minimind/discussions/611
     @torch.inference_mode()
-    def generate(self, inputs=None, attention_mask=None, max_new_tokens=8192, temperature=0.85, top_p=0.85, top_k=50, eos_token_id=2, streamer=None, use_cache=True, num_return_sequences=1, do_sample=True, repetition_penalty=1.0, **kwargs):
+    def generate(self, inputs=None, attention_mask=None, max_new_tokens=8192, temperature=0.85, top_p=0.85, top_k=50, eos_token_id=2, streamer=None, use_cache=True, num_return_sequences=1, do_sample=True, repetition_penalty=1.0, frequency_penalty=0.0, **kwargs):
         input_ids = kwargs.pop("input_ids", inputs).repeat(num_return_sequences, 1)
         attention_mask = attention_mask.repeat(num_return_sequences, 1) if attention_mask is not None else None
         past_key_values = kwargs.pop("past_key_values", None)
@@ -272,6 +272,11 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
             if repetition_penalty != 1.0:
                 for i in range(input_ids.shape[0]):
                     seen = torch.unique(input_ids[i]); score = logits[i, seen]; logits[i, seen] = torch.where(score > 0, score / repetition_penalty, score * repetition_penalty)
+            if frequency_penalty != 0.0:
+                # 按已生成 token 的出现次数扣分: logits[t] -= frequency_penalty * count(t)
+                for i in range(input_ids.shape[0]):
+                    counts = torch.bincount(input_ids[i], minlength=logits.shape[-1]).to(logits.dtype)
+                    logits[i] -= frequency_penalty * counts
             if top_k > 0: 
                 logits[logits < torch.topk(logits, top_k)[0][..., -1, None]] = -float('inf')
             if top_p < 1.0:

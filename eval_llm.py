@@ -59,6 +59,8 @@ def main():
     parser.add_argument('--max_new_tokens', default=2000, type=int, help="最大生成长度（注意：并非模型实际长文本能力）")
     parser.add_argument('--temperature', default=0.85, type=float, help="生成温度，控制随机性（0-1，越大越随机）")
     parser.add_argument('--top_p', default=0.95, type=float, help="nucleus采样阈值（0-1）")
+    parser.add_argument('--repetition_penalty', default=1.1, type=float, help="重复惩罚（1.0=不惩罚，>1 抑制已生成 token 的重复出现）")
+    parser.add_argument('--frequency_penalty', default=0.2, type=float, help="频率惩罚（0=不惩罚，>0 按已出现次数抑制 token，>1 为强惩罚）")
     parser.add_argument('--open_thinking', default=0, type=int, help="是否开启自适应思考（0=否，1=是）")
     parser.add_argument('--historys', default=0, type=int, help="携带历史对话轮数（需为偶数，0表示不携带历史）")
     parser.add_argument('--show_speed', default=1, type=int, help="显示decode速度（tokens/s）")
@@ -136,7 +138,8 @@ def main():
             inputs=inputs["input_ids"], attention_mask=inputs["attention_mask"],
             max_new_tokens=args.max_new_tokens, do_sample=True, streamer=streamer,
             pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id,
-            top_p=args.top_p, temperature=args.temperature, repetition_penalty=1
+            top_p=args.top_p, temperature=args.temperature,
+            repetition_penalty=args.repetition_penalty, frequency_penalty=args.frequency_penalty
         )
         response = tokenizer.decode(generated_ids[0][len(inputs["input_ids"][0]):], skip_special_tokens=True)
         conversation.append({"role": "assistant", "content": response})

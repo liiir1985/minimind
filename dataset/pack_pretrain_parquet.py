@@ -276,6 +276,8 @@ def parse_args():
     p.add_argument("--output-dir", required=True, help="输出目录")
     p.add_argument("--tokenizer", default=DEFAULT_TOKENIZER, help=f"tokenizer 目录 (默认 {DEFAULT_TOKENIZER})")
     p.add_argument("--max-length", type=int, default=2000, help="packed 序列长度 (默认 2000, 同 train_pretrain)")
+    p.add_argument("--min-seq-len", type=int, default=0,
+                   help="单条文本 tokenize 后长度小于此值则直接跳过 (默认 0=不过滤)")
     p.add_argument("--text-column", default="text", help="输入 parquet 的文本列名 (默认 text)")
     p.add_argument("--max-file-size", type=str, default="4GiB", help="单输出文件物理大小上限, 压缩后磁盘占用 (默认 4GiB)")
     p.add_argument("--mem-budget", type=str, default="200M", help="待打包序列 token 总量预算 (默认 200M token)")
@@ -414,6 +416,7 @@ def main():
     total_texts = 0
     total_raw_tokens = 0
     total_packed = 0
+    min_seq_len = args.min_seq_len
     t_start = time.time()
 
     def flush_pending():
@@ -446,6 +449,9 @@ def main():
         全程 numpy 操作, 避免 Python list of int 的内存膨胀。
         """
         nonlocal pending, pending_tokens, total_texts, total_raw_tokens
+        # 太短的序列直接跳过, 不参与打包 (也不计入统计)
+        if min_seq_len > 0 and len(ids) < min_seq_len:
+            return
         n = len(ids) + 2  # +bos +eos
         total_raw_tokens += n
         total_texts += 1

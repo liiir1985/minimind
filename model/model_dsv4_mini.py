@@ -1008,7 +1008,7 @@ class DeepSeekV4MiniForCausalLM(PreTrainedModel, GenerationMixin):
         )
 
     @torch.inference_mode()
-    def generate(self, inputs, attention_mask=None, max_new_tokens=100, do_sample=True, top_p=0.9, temperature=0.8, pad_token_id=0, eos_token_id=None, streamer=None, **kwargs):
+    def generate(self, inputs, attention_mask=None, max_new_tokens=100, do_sample=True, top_p=0.9, temperature=0.8, pad_token_id=0, eos_token_id=None, streamer=None, repetition_penalty=1.0, frequency_penalty=0.0, **kwargs):
         input_ids = inputs
         bsz, seqlen = input_ids.shape
         start_pos = 0
@@ -1033,6 +1033,20 @@ class DeepSeekV4MiniForCausalLM(PreTrainedModel, GenerationMixin):
                 next_token_logits = out.logits[:, -1, :]
             
             start_pos += (input_ids.shape[1] if i == 0 else 1)
+            
+            # 重复惩罚 + 频率惩罚 (对采样和贪心两种模式都生效)
+            if repetition_penalty != 1.0 or frequency_penalty != 0.0:
+                for batch_idx in range(bsz):
+                    seen_ids = generated[batch_idx]
+                    if repetition_penalty != 1.0:
+                        uniq = torch.unique(seen_ids)
+                        score = next_token_logits[batch_idx, uniq]
+                        next_token_logits[batch_idx, uniq] = torch.where(
+                            score > 0, score / repetition_penalty, score * repetition_penalty)
+                    if frequency_penalty != 0.0:
+                        # logits[t] -= frequency_penalty * count(t)
+                        counts = torch.bincount(seen_ids, minlength=next_token_logits.shape[-1]).to(next_token_logits.dtype)
+                        next_token_logits[batch_idx] -= frequency_penalty * counts
             
             if temperature > 0 and do_sample:
                 next_token_logits = next_token_logits / temperature
