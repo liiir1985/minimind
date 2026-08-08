@@ -298,8 +298,8 @@ def parse_args():
     p.add_argument("--max-batch-mem", type=str, default="512M",
                    help="pyarrow 单批解压内存估算上限 (默认 512M)。按文件平均行大小把 batch-size 钳制到 "
                         "batch x 行字节 x 3 <= 此值, 防止配置值过大时读取阶段 OOM")
-    p.add_argument("--max-batch-chars", type=str, default="10M", help="单个 tokenize 任务的最大字符数, 超长文本自动拆分 (默认 10M)")
-    p.add_argument("--max-text-chars", type=str, default="1M", help="单条文本超过此字符数先切段再 tokenize, 防 tokenizer 内存暴涨 (默认 1M)")
+    p.add_argument("--max-batch-chars", type=str, default="400K", help="单个 tokenize 任务的最大字符数, 超长文本自动拆分 (默认 10M)")
+    p.add_argument("--max-text-chars", type=str, default="100K", help="单条文本超过此字符数先切段再 tokenize, 防 tokenizer 内存暴涨 (默认 1M)")
     p.add_argument("--num-workers", type=int, default=1, help="tokenize 并行进程数 (默认 1。单核机器多进程无收益反而更慢; 多核机器可调大)")
     p.add_argument("--resume", action="store_true", help="断点续跑 (输出目录 state.json)")
     return p.parse_args()
