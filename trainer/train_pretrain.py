@@ -115,9 +115,9 @@ if __name__ == "__main__":
     parser.add_argument("--grad_clip", type=float, default=1.0, help="梯度裁剪阈值")
     parser.add_argument("--log_interval", type=int, default=100, help="日志打印间隔")
     parser.add_argument("--save_interval", type=int, default=1000, help="模型保存间隔")
-    parser.add_argument('--hidden_size', default=768, type=int, help="隐藏层维度")
-    parser.add_argument('--num_hidden_layers', default=8, type=int, help="隐藏层数量")
-    parser.add_argument('--max_seq_len', default=2000, type=int, help="训练的最大截断长度（中文1token≈1.5~1.7字符）")
+    parser.add_argument('--hidden_size', default=None, type=int, help="隐藏层维度（默认：minimind=768，dsv4_mini=1536）")
+    parser.add_argument('--num_hidden_layers', default=None, type=int, help="隐藏层数量（默认：minimind=8，dsv4_mini=25）")
+    parser.add_argument('--max_seq_len', default=4096, type=int, help="训练的最大上下文长度")
     parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
     parser.add_argument("--data_path", type=str, default="../dataset/pretrain_t2t_mini.jsonl", help="预训练数据路径 (jsonl 单文件走 PretrainDataset, 目录走 PackedPretrainDataset 读 pack_pretrain_parquet.py 产物)")
     parser.add_argument('--from_weight', default='none', type=str, help="基于哪个权重训练，为none则从头开始")
@@ -128,6 +128,8 @@ if __name__ == "__main__":
     parser.add_argument('--model_type', default='minimind', type=str, choices=['minimind', 'dsv4_mini'], help="模型类型")
     parser.add_argument('--attn_chunk_size', default=0, type=int, help="dsv4_mini HCA 训练 chunk 大小 (0=自动使用window_size; 长上下文可显式设1024/2048)")
     parser.add_argument('--ce_chunk_size', default=0, type=int, help="dsv4_mini 交叉熵 seqlen 分块大小 (0=不分块, 走原版; 长上下文时设 1024/2048)")
+    parser.add_argument('--rope_theta', default=10000.0, type=float, help="dsv4_mini 纯滑窗层 RoPE theta")
+    parser.add_argument('--compress_rope_theta', default=160000.0, type=float, help="dsv4_mini HCA 压缩层 RoPE theta")
     parser.add_argument("--profile", default=0, type=int, choices=[0, 1], help="启用PyTorch Profiler，在前8个step采样并输出trace到--profile_dir（用tensorboard查看）")
     parser.add_argument("--profile_dir", default="../prof_log", type=str, help="profiler trace输出目录")
     parser.add_argument("--packed_chunk_size", type=int, default=512, help="PackedPretrainDataset 内 chunk 打乱粒度 (行数), 越小 domain 混合越均匀 (0=按整 rg)")
@@ -144,6 +146,8 @@ if __name__ == "__main__":
     if args.model_type == 'dsv4_mini':
         lm_config = build_dsv4_mini_config(args)
     else:
+        args.hidden_size = args.hidden_size if args.hidden_size is not None else 768
+        args.num_hidden_layers = args.num_hidden_layers if args.num_hidden_layers is not None else 8
         lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe))
     ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume==1 else None
     

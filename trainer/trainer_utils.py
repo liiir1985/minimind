@@ -16,6 +16,7 @@ from transformers import AutoTokenizer, AutoModel, AutoModelForSequenceClassific
 from model.model_minimind import MiniMindForCausalLM
 from model.model_dsv4_mini import DeepSeekV4MiniConfig, DeepSeekV4MiniForCausalLM
 
+
 def _count_minimind_params(model, config):
     """MiniMind: dense or MoE. Params live at `model.layers.X.mlp.experts.Y.*`."""
     total = sum(p.numel() for p in model.parameters()) / 1e6
@@ -75,20 +76,40 @@ def get_lr(current_step, total_steps, lr):
 
 
 def build_dsv4_mini_config(args, inference: bool = False):
-    is_micro = args.hidden_size < 768
+    hidden_size = args.hidden_size if args.hidden_size is not None else 1536
+    num_hidden_layers = args.num_hidden_layers if args.num_hidden_layers is not None else 25
+    if hidden_size % 128 != 0:
+        raise ValueError(f"dsv4_mini hidden_size 必须能被 head_dim=128 整除，得到 {hidden_size}")
+    if num_hidden_layers <= 0:
+        raise ValueError(f"num_hidden_layers 必须为正整数，得到 {num_hidden_layers}")
+    args.hidden_size = hidden_size
+    args.num_hidden_layers = num_hidden_layers
+    if num_hidden_layers <= 4:
+        compress_ratios = [0] * num_hidden_layers
+    else:
+        compress_ratios = [
+            0, 0, 0,
+            *[4 if i % 2 == 0 else 64 for i in range(num_hidden_layers - 4)],
+            0,
+        ]
     inference_rope_scaling = bool(getattr(args, "inference_rope_scaling", False)) if inference else False
-    rope_factor = getattr(args, "rope_factor", 16.0)
+    rope_factor = getattr(args, "rope_factor", 12.5)
     trained_max_seq_len = args.max_seq_len
     max_seq_len = int(trained_max_seq_len * rope_factor) if inference_rope_scaling else trained_max_seq_len
 
     lm_config = DeepSeekV4MiniConfig(
-        hidden_size=args.hidden_size,
-        num_hidden_layers=args.num_hidden_layers,
-        num_attention_heads=args.hidden_size // 128 if args.hidden_size % 128 == 0 else 4,
-        moe_inter_dim=math.ceil(args.hidden_size * math.pi / 64) * 64,
+        hidden_size=hidden_size,
+        num_hidden_layers=num_hidden_layers,
+        num_attention_heads=hidden_size // 128,
+        head_dim=128,
+        rope_head_dim=64,
+        moe_inter_dim=math.ceil(hidden_size * math.pi / 64) * 64,
         num_routed_experts=1,
         num_shared_experts=0,
+        compress_ratios=compress_ratios,
         max_seq_len=max_seq_len,
+        rope_theta=getattr(args, "rope_theta", 10000.0),
+        compress_rope_theta=getattr(args, "compress_rope_theta", 160000.0),
         attn_chunk_size=getattr(args, "attn_chunk_size", 0) if getattr(args, "attn_chunk_size", 0) > 0 else None,
         ce_chunk_size=getattr(args, "ce_chunk_size", 0) if getattr(args, "ce_chunk_size", 0) > 0 else None,
         inference_rope_scaling=inference_rope_scaling,

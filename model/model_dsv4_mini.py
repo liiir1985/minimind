@@ -61,6 +61,7 @@ class DeepSeekV4MiniConfig(PretrainedConfig):
         window_size=512,
         compress_ratios=(0, 0, 4, 64, 4, 64, 4, 0),
         rope_theta=10000.0,
+        compress_rope_theta=160000.0,
         hc_mult=0,
         hc_sinkhorn_iters=10,
         hc_eps=1e-6,
@@ -104,6 +105,7 @@ class DeepSeekV4MiniConfig(PretrainedConfig):
         else:
             self.compress_ratios = [0] * num_hidden_layers
         self.rope_theta = rope_theta
+        self.compress_rope_theta = compress_rope_theta
         self.hc_mult = hc_mult
         self.hc_sinkhorn_iters = hc_sinkhorn_iters
         self.hc_eps = hc_eps
@@ -257,7 +259,7 @@ class Compressor(nn.Module):
 
         yarn_orig = config.original_seq_len if config.inference_rope_scaling else 0
         yarn_factor = config.rope_factor if config.inference_rope_scaling else 1.0
-        freqs_cis = precompute_freqs_cis(self.rope_head_dim, config.max_seq_len, config.rope_theta,
+        freqs_cis = precompute_freqs_cis(self.rope_head_dim, config.max_seq_len, config.compress_rope_theta,
                                           yarn_orig, yarn_factor, config.beta_fast, config.beta_slow)
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
 
@@ -372,9 +374,17 @@ class Attention(nn.Module):
         kv_cache_size = self.window_size
         self.register_buffer("kv_cache", torch.zeros(1, kv_cache_size, self.head_dim), persistent=False)
         
-        yarn_orig = config.original_seq_len if config.inference_rope_scaling else 0
-        yarn_factor = config.rope_factor if config.inference_rope_scaling else 1.0
-        freqs_cis = precompute_freqs_cis(self.rope_head_dim, config.max_seq_len, config.rope_theta,
+        # Pure sliding-window layers keep the high-resolution base RoPE. Only HCA
+        # layers use the long-range compression theta and inference-time YaRN.
+        if self.compress_ratio:
+            rope_theta = config.compress_rope_theta
+            yarn_orig = config.original_seq_len if config.inference_rope_scaling else 0
+            yarn_factor = config.rope_factor if config.inference_rope_scaling else 1.0
+        else:
+            rope_theta = config.rope_theta
+            yarn_orig = 0
+            yarn_factor = 1.0
+        freqs_cis = precompute_freqs_cis(self.rope_head_dim, config.max_seq_len, rope_theta,
                                           yarn_orig, yarn_factor, config.beta_fast, config.beta_slow)
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
 

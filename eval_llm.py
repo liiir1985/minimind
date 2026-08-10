@@ -21,6 +21,8 @@ def init_model(args):
             model = DeepSeekV4MiniForCausalLM(lm_config)
             moe_suffix = ''
         else:
+            args.hidden_size = args.hidden_size if args.hidden_size is not None else 768
+            args.num_hidden_layers = args.num_hidden_layers if args.num_hidden_layers is not None else 8
             model = MiniMindForCausalLM(MiniMindConfig(
                 hidden_size=args.hidden_size,
                 num_hidden_layers=args.num_hidden_layers,
@@ -50,17 +52,19 @@ def main():
     parser.add_argument('--save_dir', default='out', type=str, help="模型权重目录")
     parser.add_argument('--weight', default='full_sft', type=str, help="权重名称前缀（pretrain, full_sft, rlhf, reason, ppo_actor, grpo, spo）")
     parser.add_argument('--lora_weight', default='None', type=str, help="LoRA权重名称（None表示不使用，可选：lora_identity, lora_medical）")
-    parser.add_argument('--hidden_size', default=768, type=int, help="隐藏层维度")
-    parser.add_argument('--num_hidden_layers', default=8, type=int, help="隐藏层数量")
+    parser.add_argument('--hidden_size', default=None, type=int, help="隐藏层维度（默认：minimind=768，dsv4_mini=1536）")
+    parser.add_argument('--num_hidden_layers', default=None, type=int, help="隐藏层数量（默认：minimind=8，dsv4_mini=25）")
     parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
     parser.add_argument('--inference_rope_scaling', default=False, action='store_true', help="启用RoPE位置编码外推（YaRN，训练长度→更长）")
-    parser.add_argument('--max_seq_len', default=2048, type=int, help="dsv4_mini专用：训练时的最大上下文长度（YaRN外推起点，开启外推后实际最大长度=max_seq_len*rope_factor）")
-    parser.add_argument('--rope_factor', default=16.0, type=float, help="dsv4_mini专用：YaRN外推倍数")
+    parser.add_argument('--max_seq_len', default=8192, type=int, help="dsv4_mini专用：训练上下文长度及YaRN外推起点")
+    parser.add_argument('--rope_factor', default=12.5, type=float, help="dsv4_mini专用：HCA层YaRN外推倍数（8192×12.5=102400）")
+    parser.add_argument('--rope_theta', default=10000.0, type=float, help="dsv4_mini纯滑窗层RoPE theta")
+    parser.add_argument('--compress_rope_theta', default=160000.0, type=float, help="dsv4_mini HCA压缩层RoPE theta")
     parser.add_argument('--max_new_tokens', default=2000, type=int, help="最大生成长度（注意：并非模型实际长文本能力）")
     parser.add_argument('--temperature', default=0.85, type=float, help="生成温度，控制随机性（0-1，越大越随机）")
     parser.add_argument('--top_p', default=0.95, type=float, help="nucleus采样阈值（0-1）")
-    parser.add_argument('--repetition_penalty', default=1.1, type=float, help="重复惩罚（1.0=不惩罚，>1 抑制已生成 token 的重复出现）")
-    parser.add_argument('--frequency_penalty', default=0.2, type=float, help="频率惩罚（0=不惩罚，>0 按已出现次数抑制 token，>1 为强惩罚）")
+    parser.add_argument('--repetition_penalty', default=1.0, type=float, help="重复惩罚（1.0=不惩罚，>1 抑制已生成 token 的重复出现）")
+    parser.add_argument('--frequency_penalty', default=0.0, type=float, help="频率惩罚（0=不惩罚，>0 按已出现次数抑制 token，>1 为强惩罚）")
     parser.add_argument('--open_thinking', default=0, type=int, help="是否开启自适应思考（0=否，1=是）")
     parser.add_argument('--historys', default=0, type=int, help="携带历史对话轮数（需为偶数，0表示不携带历史）")
     parser.add_argument('--show_speed', default=1, type=int, help="显示decode速度（tokens/s）")
