@@ -21,6 +21,25 @@ from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint
 warnings.filterwarnings('ignore')
 
 
+def build_optimizer(model, args):
+    if args.optimizer == 'adamw':
+        Logger('Optimizer: torch.optim.AdamW (fp32 states)')
+        return optim.AdamW(model.parameters(), lr=args.learning_rate)
+
+    if args.optimizer == 'adamw8bit':
+        try:
+            from bitsandbytes.optim import AdamW8bit
+        except ImportError as exc:
+            raise ImportError(
+                "未安装 bitsandbytes，无法使用 --optimizer adamw8bit。"
+                "请在训练环境安装 bitsandbytes，或显式传 --optimizer adamw。"
+            ) from exc
+        Logger('Optimizer: bitsandbytes AdamW8bit (8-bit states)')
+        return AdamW8bit(model.parameters(), lr=args.learning_rate)
+
+    raise ValueError(f"未知优化器: {args.optimizer}")
+
+
 def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
     start_time = time.time()
     last_step = start_step
@@ -108,6 +127,8 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=2, help="训练轮数")
     parser.add_argument("--batch_size", type=int, default=8, help="batch size")
     parser.add_argument("--learning_rate", type=float, default=5e-4, help="初始学习率")
+    parser.add_argument("--optimizer", type=str, default="adamw8bit", choices=["adamw8bit", "adamw"],
+                        help="优化器: adamw8bit 使用 bitsandbytes 8-bit AdamW 以节省显存; adamw 使用 PyTorch fp32 AdamW")
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu", help="训练设备")
     parser.add_argument("--dtype", type=str, default="bfloat16", help="混合精度类型")
     parser.add_argument("--num_workers", type=int, default=8, help="数据加载线程数")
@@ -176,7 +197,7 @@ if __name__ == "__main__":
         train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
-    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
+    optimizer = build_optimizer(model, args)
     
     # ========== 6. 从ckp恢复状态 ==========
     start_epoch, start_step = 0, 0

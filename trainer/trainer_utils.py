@@ -76,8 +76,8 @@ def get_lr(current_step, total_steps, lr):
 
 
 def build_dsv4_mini_config(args, inference: bool = False):
-    hidden_size = args.hidden_size if args.hidden_size is not None else 1536
-    num_hidden_layers = args.num_hidden_layers if args.num_hidden_layers is not None else 25
+    hidden_size = args.hidden_size if args.hidden_size is not None else 2048
+    num_hidden_layers = args.num_hidden_layers if args.num_hidden_layers is not None else 14
     if hidden_size % 128 != 0:
         raise ValueError(f"dsv4_mini hidden_size 必须能被 head_dim=128 整除，得到 {hidden_size}")
     if num_hidden_layers <= 0:
