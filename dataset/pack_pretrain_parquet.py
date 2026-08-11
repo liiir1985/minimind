@@ -34,6 +34,7 @@ import json
 import multiprocessing as mp
 import os
 import re
+import shutil
 import sys
 import time
 import zlib
@@ -294,16 +295,16 @@ class OutputWriter:
         self.writer = None
         self.schema = pa.schema([("input_ids", pa.list_(pa.int32(), max_length))])
 
-    def write(self, bins: list):
-        """bins: list[np.ndarray (max_length,) uint32]"""
-        if not bins:
+    def write_rows(self, rows):
+        """rows: np.ndarray/list with shape [N, max_length]"""
+        if len(rows) == 0:
             return
         if self.writer is None:
             self.path = os.path.join(self.out_dir, f"part-{self.file_idx:05d}.parquet")
             self.writer = pq.ParquetWriter(self.path, self.schema, compression="zstd", compression_level=9)
 
-        values = np.stack(bins).astype(np.int32).reshape(-1)
-        arr = pa.FixedSizeListArray.from_arrays(pa.array(values), self.max_length)
+        values = np.asarray(rows, dtype=np.int32).reshape(-1)
+        arr = pa.FixedSizeListArray.from_arrays(pa.array(values, type=pa.int32()), self.max_length)
         self.writer.write_table(pa.table({"input_ids": arr}))
 
         # 按物理大小 (压缩后) 切文件: write_table 已把 row group 写入文件,
@@ -314,6 +315,12 @@ class OutputWriter:
             self.file_idx += 1
             self.physical_bytes = 0
 
+    def write(self, bins: list):
+        """bins: list[np.ndarray (max_length,) uint32]"""
+        if not bins:
+            return
+        self.write_rows(np.stack(bins))
+
     def close_current(self):
         if self.writer is not None:
             self.writer.close()
@@ -321,6 +328,113 @@ class OutputWriter:
 
     def close(self):
         self.close_current()
+
+
+class BucketShuffleWriter:
+    """先把 packed rows 随机写入临时 buckets，最后 bucket 内 shuffle 后合并输出。"""
+
+    def __init__(
+        self,
+        temp_dir: str,
+        output_writer: OutputWriter,
+        max_length: int,
+        num_buckets: int,
+        bucket_buffer_rows: int,
+        final_flush_rows: int,
+        seed: int,
+        temp_compression_level: int = 9,
+    ):
+        if num_buckets <= 0:
+            raise ValueError(f"shuffle bucket 数必须 > 0, 得到 {num_buckets}")
+        self.temp_dir = temp_dir
+        self.output_writer = output_writer
+        self.max_length = max_length
+        self.num_buckets = num_buckets
+        self.bucket_buffer_rows = max(1, bucket_buffer_rows)
+        self.final_flush_rows = final_flush_rows
+        self.rng = np.random.default_rng(seed)
+        self.merge_seed = seed + 1009
+        self.temp_compression_level = temp_compression_level
+        self.schema = output_writer.schema
+        self.buffers = {}
+        self.counts = {}
+        self.part_counts = {}
+        self.total_rows = 0
+        os.makedirs(self.temp_dir, exist_ok=True)
+
+    def _rows_to_table(self, rows: np.ndarray):
+        values = np.asarray(rows, dtype=np.int32).reshape(-1)
+        arr = pa.FixedSizeListArray.from_arrays(pa.array(values, type=pa.int32()), self.max_length)
+        return pa.table({"input_ids": arr})
+
+    def _flush_bucket(self, bucket: int):
+        count = self.counts.get(bucket, 0)
+        if count <= 0:
+            return
+        rows = np.concatenate(self.buffers[bucket], axis=0)
+        bdir = os.path.join(self.temp_dir, f"bucket-{bucket:05d}")
+        os.makedirs(bdir, exist_ok=True)
+        part_idx = self.part_counts.get(bucket, 0)
+        path = os.path.join(bdir, f"part-{part_idx:05d}.parquet")
+        pq.write_table(
+            self._rows_to_table(rows),
+            path,
+            compression="zstd",
+            compression_level=self.temp_compression_level,
+        )
+        self.part_counts[bucket] = part_idx + 1
+        self.buffers[bucket] = []
+        self.counts[bucket] = 0
+
+    def write(self, bins: list):
+        if not bins:
+            return
+        rows = np.stack(bins).astype(np.int32, copy=False)
+        buckets = self.rng.integers(0, self.num_buckets, size=len(rows), dtype=np.int32)
+        for bucket in np.unique(buckets):
+            bucket = int(bucket)
+            chunk = rows[buckets == bucket]
+            self.buffers.setdefault(bucket, []).append(chunk.copy())
+            self.counts[bucket] = self.counts.get(bucket, 0) + len(chunk)
+            if self.counts[bucket] >= self.bucket_buffer_rows:
+                self._flush_bucket(bucket)
+        self.total_rows += len(rows)
+
+    def close_buckets(self):
+        for bucket in list(self.buffers.keys()):
+            self._flush_bucket(bucket)
+
+    def merge_to_output(self):
+        self.close_buckets()
+        bucket_order = np.arange(self.num_buckets, dtype=np.int32)
+        np.random.default_rng(self.merge_seed).shuffle(bucket_order)
+        written = 0
+        for bucket in tqdm(bucket_order, desc="merge shuffle buckets", unit="bucket"):
+            bdir = os.path.join(self.temp_dir, f"bucket-{int(bucket):05d}")
+            if not os.path.isdir(bdir):
+                continue
+            parts = [os.path.join(bdir, f) for f in os.listdir(bdir) if f.endswith(".parquet")]
+            parts.sort(key=natural_key)
+            if not parts:
+                continue
+            chunks = []
+            for part in parts:
+                pf = pq.ParquetFile(part)
+                for rg in range(pf.metadata.num_row_groups):
+                    table = pf.read_row_group(rg, columns=["input_ids"])
+                    arr = table.column("input_ids")
+                    if hasattr(arr, "combine_chunks"):
+                        arr = arr.combine_chunks()
+                    values = arr.values.to_numpy(zero_copy_only=False)
+                    chunks.append(values.reshape(-1, self.max_length))
+            rows = np.concatenate(chunks, axis=0)
+            order = np.random.default_rng(self.merge_seed + int(bucket)).permutation(len(rows))
+            rows = rows[order]
+            for start in range(0, len(rows), self.final_flush_rows):
+                self.output_writer.write_rows(rows[start:start + self.final_flush_rows])
+            written += len(rows)
+        self.output_writer.close()
+        return written
 
 
 # ---------------------------------------------------------------- main ----
@@ -363,6 +477,17 @@ def parse_args():
     p.add_argument("--max-batch-chars", type=str, default="400K", help="单个 tokenize 任务的最大字符数, 超长文本自动拆分 (默认 10M)")
     p.add_argument("--max-text-chars", type=str, default="100K", help="单条文本超过此字符数先切段再 tokenize, 防 tokenizer 内存暴涨 (默认 1M)")
     p.add_argument("--num-workers", type=int, default=1, help="tokenize 并行进程数 (默认 1。单核机器多进程无收益反而更慢; 多核机器可调大)")
+    p.add_argument("--shuffle-buckets", type=int, default=0,
+                   help="输出端随机 bucket 数 (默认 0=关闭)。>0 时先写临时随机桶, 最后桶内 shuffle 后合并输出")
+    p.add_argument("--shuffle-temp-dir", default=None,
+                   help="shuffle 临时 bucket 目录 (默认 output-dir + .shuffle_tmp)")
+    p.add_argument("--shuffle-seed", type=int, default=42, help="输出端 bucket shuffle 随机种子")
+    p.add_argument("--shuffle-bucket-buffer-rows", type=int, default=256,
+                   help="每个 shuffle bucket 的内存缓冲行数 (默认 256, 越大临时小文件越少但内存越高)")
+    p.add_argument("--shuffle-temp-compression-level", type=int, default=9,
+                   help="shuffle 临时 bucket parquet 的 zstd 压缩级别 (默认 9, 控制磁盘峰值)")
+    p.add_argument("--shuffle-overwrite-temp", action="store_true",
+                   help="允许删除已有 shuffle 临时目录")
     p.add_argument("--resume", action="store_true", help="断点续跑 (输出目录 state.json)")
     return p.parse_args()
 
@@ -425,6 +550,9 @@ def main():
     max_batch_mem = parse_size(args.max_batch_mem)
     if not (0 <= args.sample_prob <= 1):
         raise ValueError(f"--sample-prob 必须在 [0, 1] 内, 得到 {args.sample_prob}")
+    shuffle_enabled = args.shuffle_buckets > 0
+    if shuffle_enabled and args.resume:
+        raise ValueError("--shuffle-buckets > 0 暂不支持 --resume；请从头生成 shuffled packed 数据")
     batch_cfg = load_batch_config(args.config)
     if batch_cfg:
         print(f"加载 batch-size 配置: {args.config} ({len(batch_cfg)} 条模式)")
@@ -452,6 +580,16 @@ def main():
         sys.exit(f"输入目录下没有找到 .parquet 文件: {args.input_dir}")
     print(f"找到 {len(files)} 个 parquet 文件")
 
+    shuffle_temp_dir = os.path.abspath(args.shuffle_temp_dir or (args.output_dir + ".shuffle_tmp"))
+    if shuffle_enabled:
+        if os.path.abspath(shuffle_temp_dir) == os.path.abspath(args.output_dir):
+            raise ValueError("--shuffle-temp-dir 不能与 --output-dir 相同")
+        if os.path.exists(shuffle_temp_dir):
+            if not args.shuffle_overwrite_temp:
+                raise FileExistsError(f"shuffle 临时目录已存在: {shuffle_temp_dir} (需要覆盖请加 --shuffle-overwrite-temp)")
+            shutil.rmtree(shuffle_temp_dir)
+        print(f"启用输出端 bucket shuffle: buckets={args.shuffle_buckets}, temp={shuffle_temp_dir}")
+
     state = load_state(args.output_dir)
     if args.resume and state["done_inputs"]:
         done = set(state["done_inputs"])
@@ -468,6 +606,20 @@ def main():
     packer = BinPacker(args.max_length, pad_id, args.max_open_bins)
     writer = OutputWriter(args.output_dir, args.max_length, max_file_size,
                           start_idx=state["closed_files"])
+    data_writer = writer
+    shuffle_writer = None
+    if shuffle_enabled:
+        shuffle_writer = BucketShuffleWriter(
+            temp_dir=shuffle_temp_dir,
+            output_writer=writer,
+            max_length=args.max_length,
+            num_buckets=args.shuffle_buckets,
+            bucket_buffer_rows=args.shuffle_bucket_buffer_rows,
+            final_flush_rows=flush_rows,
+            seed=args.shuffle_seed,
+            temp_compression_level=args.shuffle_temp_compression_level,
+        )
+        data_writer = shuffle_writer
 
     # 多进程 tokenize 池 (BPE 受 GIL 限制, 必须用进程而非线程)
     pool = None
@@ -500,7 +652,7 @@ def main():
     def flush_writer_buf():
         nonlocal total_packed
         if len(packer.finalized) >= flush_rows:
-            writer.write(packer.finalized)
+            data_writer.write(packer.finalized)
             total_packed += len(packer.finalized)
             packer.finalized.clear()
 
@@ -671,7 +823,7 @@ def main():
         # (part 文件边界只由逻辑大小决定, 与输入文件边界无关, writer 保持打开)
         flush_pending()
         if packer.finalized:
-            writer.write(packer.finalized)
+            data_writer.write(packer.finalized)
             total_packed += len(packer.finalized)
             packer.finalized.clear()
         state["done_inputs"].append(fpath)
@@ -683,14 +835,23 @@ def main():
     # 收尾: 池中所有 bin 落盘
     flush_pending()
     packer.flush_all()
-    writer.write(packer.finalized)
+    data_writer.write(packer.finalized)
     total_packed += len(packer.finalized)
     packer.finalized.clear()
-    writer.close()
 
     if pool is not None:
         pool.close()
         pool.join()
+        pool = None
+
+    if shuffle_writer is not None:
+        print("合并 shuffle buckets 到最终 parquet ...")
+        shuffled_rows = shuffle_writer.merge_to_output()
+        if shuffled_rows != total_packed:
+            raise RuntimeError(f"shuffle 合并行数不一致: buckets={shuffled_rows}, packed={total_packed}")
+        shutil.rmtree(shuffle_temp_dir)
+    else:
+        writer.close()
 
     state["closed_files"] = writer.file_idx
     save_state(args.output_dir, state)
