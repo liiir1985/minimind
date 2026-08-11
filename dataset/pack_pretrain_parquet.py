@@ -36,6 +36,7 @@ import os
 import re
 import sys
 import time
+import zlib
 
 # 强制离线: worker 子进程 from_pretrained 时不得访问 HF hub (网络超时会拖垮启动)
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
@@ -66,9 +67,14 @@ def find_parquet_files(input_dir: str):
 
 
 def load_batch_config(path):
-    """加载 batch-size 配置文件: JSON {文件名模式: batch_size}
+    """加载 batch-size / sample-prob 配置文件。
 
-    模式用 fnmatch 匹配文件名 (basename), 按插入顺序第一个命中生效。
+    模式用 fnmatch 匹配相对路径或文件名, 按插入顺序第一个命中生效。
+    支持两种写法:
+      {"*.parquet": 16}
+      {"aabbb": {"batch_size": 16, "sample_prob": 0.2}}
+
+    batch_size <= 0 或 sample_prob <= 0 表示跳过该输入文件/目录。
     """
     if not path:
         return {}
@@ -77,17 +83,64 @@ def load_batch_config(path):
     if not isinstance(cfg, dict):
         raise ValueError(f"配置文件必须是 JSON 对象 {{文件名模式: batch_size}}: {path}")
     for k, v in cfg.items():
-        if not isinstance(v, int) or v <= 0:
-            raise ValueError(f"配置项 {k!r} 的值必须是正整数 batch_size, 得到 {v!r}")
+        if isinstance(v, int):
+            continue
+        if not isinstance(v, dict):
+            raise ValueError(f"配置项 {k!r} 必须是整数 batch_size 或对象, 得到 {v!r}")
+        allowed = {"batch_size", "sample_prob"}
+        extra = set(v) - allowed
+        if extra:
+            raise ValueError(f"配置项 {k!r} 含未知字段 {sorted(extra)}, 允许字段: {sorted(allowed)}")
+        if "batch_size" in v and not isinstance(v["batch_size"], int):
+            raise ValueError(f"配置项 {k!r}.batch_size 必须是整数, 得到 {v['batch_size']!r}")
+        if "sample_prob" in v:
+            prob = v["sample_prob"]
+            if not isinstance(prob, (int, float)) or prob > 1:
+                raise ValueError(f"配置项 {k!r}.sample_prob 必须 <= 1 (<=0 表示跳过), 得到 {prob!r}")
     return cfg
 
 
-def batch_size_for(cfg, fpath, default):
-    base = os.path.basename(fpath)
+def _match_config_pattern(pattern: str, relpath: str, base: str) -> bool:
+    """匹配 config 模式。
+
+    - 兼容旧行为: 无路径分隔符的通配模式匹配 basename, 如 Harem*.parquet
+    - 新行为: 带路径分隔符的模式匹配 input-dir 下的相对路径, 如 aabbb/*.parquet
+    - 目录简写: 无通配符的 aabbb 匹配 aabbb/ 下所有 parquet
+    """
+    pat = pattern.replace("\\", "/").strip("/")
+    rel = relpath.replace("\\", "/").strip("/")
+    has_glob = any(ch in pat for ch in "*?[]")
+    has_sep = "/" in pat
+
+    if has_sep:
+        return fnmatch.fnmatch(rel, pat)
+
+    if fnmatch.fnmatch(base, pat):
+        return True
+
+    if not has_glob and rel.startswith(pat + "/"):
+        return True
+
+    return False
+
+
+def config_for(cfg, relpath, default_batch_size, default_sample_prob=1.0):
+    rel = relpath.replace("\\", "/")
+    base = os.path.basename(rel)
     for pattern, bs in cfg.items():
-        if fnmatch.fnmatch(base, pattern):
-            return bs
-    return default
+        if _match_config_pattern(pattern, rel, base):
+            if isinstance(bs, int):
+                return bs, default_sample_prob
+            return (
+                bs.get("batch_size", default_batch_size),
+                float(bs.get("sample_prob", default_sample_prob)),
+            )
+    return default_batch_size, default_sample_prob
+
+
+def batch_size_for(cfg, relpath, default):
+    """兼容旧调用: 只返回 batch-size。"""
+    return config_for(cfg, relpath, default)[0]
 
 
 # ---------------------------------------------------------------- tokenize workers ----
@@ -110,6 +163,8 @@ def _tokenize_batch(payload):
     100 万 token 的 list 约 28MB, 会撑爆结果队列。
     """
     texts, rows_done = payload
+    if not texts:
+        return [], rows_done
     enc = _WORKER_TOK(texts, add_special_tokens=False)
     return [np.asarray(ids, dtype=np.uint32) for ids in enc["input_ids"]], rows_done
 
@@ -288,10 +343,17 @@ def parse_args():
                         "超大文本行文件 (每行整本书) 必须小, 8192 会把整列一次解压进内存直接 OOM。"
                         "若指定 --config, 命中配置模式的文件以配置值为准")
     p.add_argument("--config", default=None,
-                   help="batch-size 配置文件 (JSON): {文件名模式: batch_size}, 按插入顺序第一个命中生效, "
-                        "\"*\" 可作兜底。例: {\"Harem*.parquet\": 16, \"*\": 8192}。"
+                   help="batch-size/跳过配置文件 (JSON): {模式: batch_size}, 按插入顺序第一个命中生效; "
+                        "值 <= 0 表示跳过; 也可写 {\"batch_size\": 16, \"sample_prob\": 0.2}。"
+                        "模式可匹配文件名或相对路径, "
+                        "\"*\" 可作兜底。例: {\"aabbb\": {\"batch_size\": 16, \"sample_prob\": 0.2}, "
+                        "\"Harem*.parquet\": 16, \"badset\": 0, \"*\": 8192}。"
                         "未命中任何模式的文件用 --batch-size 默认值 (默认 16, 安全)。"
                         "脚本会按文件平均行大小自动钳制过大值, 配错也不会 OOM")
+    p.add_argument("--sample-prob", type=float, default=1.0,
+                   help="全局行级采样概率 (默认 1.0=全量)。可被 --config 中 sample_prob 覆盖")
+    p.add_argument("--sample-seed", type=int, default=42,
+                   help="行级采样随机种子 (默认 42)。同一输入路径和 seed 下采样可复现")
     p.add_argument("--slice-bytes", type=str, default="64M",
                    help="to_pylist 单次切片的 UTF-8 字节预算 (默认 64M)。pyarrow 解压出的 batch 按此预算"
                         "再细切片转 Python str, 防止整批复制造成峰值 (超大行文件必需)")
@@ -361,6 +423,8 @@ def main():
     max_text_chars = parse_size(args.max_text_chars)
     slice_bytes = parse_size(args.slice_bytes)
     max_batch_mem = parse_size(args.max_batch_mem)
+    if not (0 <= args.sample_prob <= 1):
+        raise ValueError(f"--sample-prob 必须在 [0, 1] 内, 得到 {args.sample_prob}")
     batch_cfg = load_batch_config(args.config)
     if batch_cfg:
         print(f"加载 batch-size 配置: {args.config} ({len(batch_cfg)} 条模式)")
@@ -493,9 +557,20 @@ def main():
 
     print("开始处理 ...")
     for fi, fpath in enumerate(files, 1):
+        fname = os.path.relpath(fpath, args.input_dir).replace("\\", "/")
+        # 配置值 <= 0 表示跳过该文件/目录。先判断再打开 parquet,
+        # 避免被跳过的大文件仍产生 metadata/IO 开销。
+        batch_size, sample_prob = config_for(batch_cfg, fname, args.batch_size, args.sample_prob)
+        if batch_size <= 0 or sample_prob <= 0:
+            print(f"  {fname}: 配置 batch-size={batch_size}, sample-prob={sample_prob:g}, 跳过")
+            continue
+        if sample_prob > 1:
+            raise ValueError(f"{fname}: sample_prob 必须在 [0, 1] 内, 得到 {sample_prob}")
+
         pf = pq.ParquetFile(fpath)
         nrows = pf.metadata.num_rows
-        fname = os.path.relpath(fpath, args.input_dir)
+        file_seed = (args.sample_seed + zlib.adler32(fname.encode("utf-8"))) & 0xFFFFFFFF
+        sample_rng = np.random.default_rng(file_seed)
         # 估算 text 列平均行大小 (未压缩字节数, 真实文本近似 UTF-8 大小)
         try:
             col_idx = pf.metadata.schema.names.index(args.text_column)
@@ -506,7 +581,6 @@ def main():
             sys.exit(f"列 {args.text_column} 不存在于 {fname}")
         avg_row = uncompressed / max(nrows, 1)
         # 配置/参数 -> batch-size; 按平均行大小钳制, 防配置过大时读取阶段 OOM
-        batch_size = batch_size_for(batch_cfg, fpath, args.batch_size)
         if avg_row > 0:
             capped = max(1, min(batch_size, int(max_batch_mem / (avg_row * 3))))
             if capped < batch_size:
@@ -516,6 +590,8 @@ def main():
             else:
                 print(f"  {fname}: 平均行 {avg_row/2**20:.2f} MB, batch-size = {batch_size}"
                       f" (解压 ~{batch_size*avg_row*3/2**20:.0f} MB)")
+        if sample_prob < 1.0:
+            print(f"  {fname}: 行级采样 sample-prob = {sample_prob:g} (seed={file_seed})")
         pbar = tqdm(total=nrows, desc=f"[{fi}/{len(files)}] {fname}", unit="row",
                     leave=False, dynamic_ncols=True)
 
@@ -524,6 +600,17 @@ def main():
             # 避免整批转 Python str 造成峰值 (pyarrow 数组与 str 副本同时存在)
             # yield (sub, rows_done): rows_done 仅在该组最后一个 sub 非 0,
             # 携带本组行数, 供进度条按已处理行数计数
+            def emit_texts(texts, rows_done):
+                if sample_prob < 1.0:
+                    keep = sample_rng.random(len(texts)) < sample_prob
+                    texts = [t for t, k in zip(texts, keep) if k]
+                    if not texts:
+                        yield ([], rows_done)
+                        return
+                subs = list(char_split(split_long_texts(texts, max_text_chars), max_batch_chars))
+                for si, sub in enumerate(subs):
+                    yield (sub, rows_done if si == len(subs) - 1 else 0)
+
             for b in pf.iter_batches(batch_size=batch_size, columns=[args.text_column]):
                 col = b.column(args.text_column)
                 n = len(col)
@@ -534,15 +621,11 @@ def main():
                     if acc >= slice_bytes and i + 1 < n:
                         texts = [str(t) for t in col.slice(start, i - start + 1).to_pylist()]
                         # 先按单条切段 (防 tokenizer 内存暴涨), 再按累计字符数切子 batch
-                        subs = list(char_split(split_long_texts(texts, max_text_chars), max_batch_chars))
-                        for si, sub in enumerate(subs):
-                            yield (sub, len(texts) if si == len(subs) - 1 else 0)
+                        yield from emit_texts(texts, len(texts))
                         start, acc = i + 1, 0
                 if start < n:
                     texts = [str(t) for t in col.slice(start, n - start).to_pylist()]
-                    subs = list(char_split(split_long_texts(texts, max_text_chars), max_batch_chars))
-                    for si, sub in enumerate(subs):
-                        yield (sub, len(texts) if si == len(subs) - 1 else 0)
+                    yield from emit_texts(texts, len(texts))
 
         file_segments = 0
         if pool is not None:
@@ -574,6 +657,9 @@ def main():
                 launch()
         else:
             for sub, rows_done in row_batches():
+                if not sub:
+                    pbar.update(rows_done)
+                    continue
                 enc = tok(sub, add_special_tokens=False)
                 for ids in enc["input_ids"]:
                     process_ids(np.asarray(ids, dtype=np.uint32))
