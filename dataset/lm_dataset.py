@@ -1,5 +1,6 @@
 from torch.utils.data import Dataset
 import torch
+import torch.distributed as dist
 import json
 import os
 import re
@@ -332,6 +333,103 @@ class PackedPretrainDataset(Dataset):
 def pa_is_fixed_size_list(t):
     import pyarrow as pa
     return pa.types.is_fixed_size_list(t)
+
+
+class InMemoryTupleDataset(Dataset):
+    """把固定验证样本常驻在 CPU Tensor 中，适用于返回 tuple[tensor, ...] 的 LM 数据集。"""
+
+    def __init__(self, *tensors):
+        if not tensors:
+            raise ValueError("InMemoryTupleDataset 至少需要一个 tensor")
+        first_len = tensors[0].size(0)
+        if any(t.size(0) != first_len for t in tensors):
+            raise ValueError("所有 tensor 的第 0 维长度必须一致")
+        self.tensors = tensors
+
+    def __len__(self):
+        return self.tensors[0].size(0)
+
+    def __getitem__(self, index):
+        return tuple(t[index] for t in self.tensors)
+
+
+def build_in_memory_validation_dataset(dataset, val_ratio=0.001, val_seed=2024, logger=print):
+    """从任意 tuple[tensor, ...] 数据集中固定抽样，构建常驻 CPU 内存的验证集。"""
+    if val_ratio <= 0:
+        return None, set()
+
+    val_size = max(1, int(len(dataset) * val_ratio))
+    rng = random.Random(val_seed)
+    val_indices = rng.sample(range(len(dataset)), min(val_size, len(dataset)))
+    val_index_set = set(val_indices)
+
+    # packed parquet 按全局行号排序读取，避免抽验证集时频繁解压不同 row_group。
+    load_indices = sorted(val_indices) if isinstance(dataset, PackedPretrainDataset) else val_indices
+    logger(f'抽取验证集到内存: {len(load_indices):,} 条 ({val_ratio:.4%})')
+
+    columns = None
+    py_state = random.getstate()
+    np_state = np.random.get_state()
+    torch_state = torch.get_rng_state()
+    random.seed(val_seed)
+    np.random.seed(val_seed)
+    torch.manual_seed(val_seed)
+    try:
+        for idx in load_indices:
+            sample = dataset[idx]
+            if not isinstance(sample, tuple):
+                sample = (sample,)
+            if columns is None:
+                columns = [[] for _ in sample]
+            if len(sample) != len(columns):
+                raise ValueError("数据集 __getitem__ 返回的字段数量不稳定")
+            for col, value in zip(columns, sample):
+                col.append(value)
+    finally:
+        random.setstate(py_state)
+        np.random.set_state(np_state)
+        torch.set_rng_state(torch_state)
+
+    if columns is None:
+        raise ValueError("无法从空数据集抽取验证集")
+
+    tensors = [torch.stack(col).contiguous() for col in columns]
+    g = torch.Generator().manual_seed(val_seed)
+    perm = torch.randperm(tensors[0].size(0), generator=g)
+    val_ds = InMemoryTupleDataset(*(t[perm] for t in tensors))
+    logger(f'验证集已常驻CPU内存: {len(val_ds):,} 条')
+    return val_ds, val_index_set
+
+
+def filter_validation_indices(indices, val_index_set):
+    if not val_index_set:
+        return indices
+    if isinstance(indices, np.ndarray):
+        val_indices = np.fromiter(val_index_set, dtype=indices.dtype, count=len(val_index_set))
+        return indices[~np.isin(indices, val_indices)]
+    return [int(i) for i in indices if int(i) not in val_index_set]
+
+
+def shard_dataset_indices(indices, batch_size):
+    """DDP 下按 rank 切分 index 序列，并补齐到 global batch 的整数倍。"""
+    if not dist.is_initialized():
+        return indices
+
+    world_size = dist.get_world_size()
+    rank = dist.get_rank()
+    total = len(indices)
+    if total == 0:
+        return indices
+    samples_per_global_batch = batch_size * world_size
+    padded_total = ((total + samples_per_global_batch - 1) // samples_per_global_batch) * samples_per_global_batch
+    if padded_total > total:
+        pad = padded_total - total
+        if isinstance(indices, np.ndarray):
+            indices = np.concatenate([indices, indices[np.arange(pad) % total]])
+        else:
+            indices = list(indices)
+            indices.extend(indices[i % total] for i in range(pad))
+    return indices[rank:padded_total:world_size]
 
 
 class SFTDataset(Dataset):

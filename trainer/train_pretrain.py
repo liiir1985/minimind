@@ -13,9 +13,9 @@ import torch.distributed as dist
 from contextlib import nullcontext
 from torch import optim, nn
 from torch.nn.parallel import DistributedDataParallel
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader
 from model.model_minimind import MiniMindConfig
-from dataset.lm_dataset import PretrainDataset, PackedPretrainDataset
+from dataset.lm_dataset import PretrainDataset, PackedPretrainDataset, build_in_memory_validation_dataset, filter_validation_indices, shard_dataset_indices
 from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, init_model, SkipBatchSampler, build_dsv4_mini_config
 
 warnings.filterwarnings('ignore')
@@ -40,7 +40,35 @@ def build_optimizer(model, args):
     raise ValueError(f"未知优化器: {args.optimizer}")
 
 
-def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
+@torch.no_grad()
+def evaluate_validation_loss(val_loader, max_batches):
+    if val_loader is None or max_batches <= 0:
+        return None
+
+    was_training = model.training
+    model.eval()
+    total = torch.tensor([0.0, 0.0], device=args.device)
+    for batch_idx, (input_ids, labels) in enumerate(val_loader):
+        if batch_idx >= max_batches:
+            break
+        input_ids = input_ids.to(args.device, non_blocking=True)
+        labels = labels.to(args.device, non_blocking=True)
+        with autocast_ctx:
+            res = model(input_ids, labels=labels)
+            aux_loss = res.aux_loss if res.aux_loss is not None else 0.0
+            loss = res.loss + aux_loss
+        total[0] += loss.detach()
+        total[1] += 1
+        del input_ids, labels, res, loss
+
+    if dist.is_initialized():
+        dist.all_reduce(total, op=dist.ReduceOp.SUM)
+    if was_training:
+        model.train()
+    return (total[0] / total[1]).item() if total[1].item() > 0 else None
+
+
+def train_epoch(epoch, loader, val_loader, iters, start_step=0, wandb=None):
     start_time = time.time()
     last_step = start_step
     prof = None
@@ -88,17 +116,26 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
                 prof = None
                 return
 
-        if step % args.log_interval == 0 or step == iters:
+        do_save = step % args.save_interval == 0 or step == iters
+        do_log = step % args.log_interval == 0 or step == iters or do_save
+        if do_log:
             spend_time = time.time() - start_time
             current_loss = loss.item() * args.accumulation_steps
             current_aux_loss = res.aux_loss.item() if res.aux_loss is not None else 0.0
             current_logits_loss = current_loss - current_aux_loss
             current_lr = optimizer.param_groups[-1]['lr']
             eta_min = spend_time / max(step - start_step, 1) * (iters - step) // 60
-            Logger(f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), loss: {current_loss:.4f}, logits_loss: {current_logits_loss:.4f}, aux_loss: {current_aux_loss:.4f}, lr: {current_lr:.8f}, epoch_time: {eta_min:.1f}min')
-            if wandb: wandb.log({"loss": current_loss, "logits_loss": current_logits_loss, "aux_loss": current_aux_loss, "learning_rate": current_lr, "epoch_time": eta_min})
+            val_batches = args.val_save_batches if do_save else args.val_log_batches
+            val_loss = evaluate_validation_loss(val_loader, val_batches)
+            val_msg = f', val_loss({val_batches}b): {val_loss:.4f}' if val_loss is not None else ''
+            Logger(f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), loss: {current_loss:.4f}, logits_loss: {current_logits_loss:.4f}, aux_loss: {current_aux_loss:.4f}{val_msg}, lr: {current_lr:.8f}, epoch_time: {eta_min:.1f}min')
+            if wandb:
+                log_data = {"loss": current_loss, "logits_loss": current_logits_loss, "aux_loss": current_aux_loss, "learning_rate": current_lr, "epoch_time": eta_min}
+                if val_loss is not None:
+                    log_data["val_loss"] = val_loss
+                wandb.log(log_data)
 
-        if (step % args.save_interval == 0 or step == iters) and is_main_process():
+        if do_save and is_main_process():
             model.eval()
             moe_suffix = '_moe' if getattr(lm_config, 'use_moe', False) else ''
             ckp = f'{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
@@ -155,6 +192,10 @@ if __name__ == "__main__":
     parser.add_argument("--profile_dir", default="../prof_log", type=str, help="profiler trace输出目录")
     parser.add_argument("--packed_chunk_size", type=int, default=512, help="PackedPretrainDataset 内 chunk 打乱粒度 (行数), 越小 domain 混合越均匀 (0=按整 rg)")
     parser.add_argument("--packed_mix_rgs", type=int, default=4, help="PackedPretrainDataset 同时交错的 row_group 数量, cache_row_groups 需 >= 此值")
+    parser.add_argument("--val_ratio", type=float, default=0.001, help="从训练数据中固定抽取的验证集比例 (默认0.1%%; <=0关闭)")
+    parser.add_argument("--val_seed", type=int, default=2024, help="验证集抽样随机种子")
+    parser.add_argument("--val_log_batches", type=int, default=1, help="普通loss日志时计算验证集loss的batch数")
+    parser.add_argument("--val_save_batches", type=int, default=20, help="save_interval/epoch末尾时计算验证集loss的batch数")
     args = parser.parse_args()
 
     # ========== 1. 初始化环境和随机种子 ==========
@@ -195,7 +236,9 @@ if __name__ == "__main__":
                f'chunk_size={args.packed_chunk_size}, mix_rgs={args.packed_mix_rgs}')
     else:
         train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
-    train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
+    val_ds, val_index_set = build_in_memory_validation_dataset(train_ds, args.val_ratio, args.val_seed, Logger)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=0,
+                            pin_memory=(device_type == "cuda")) if val_ds is not None else None
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
     optimizer = build_optimizer(model, args)
     
@@ -218,7 +261,6 @@ if __name__ == "__main__":
     # ========== 8. 开始训练 ==========
     is_packed = isinstance(train_ds, PackedPretrainDataset)
     for epoch in range(start_epoch, args.epochs):
-        train_sampler and train_sampler.set_epoch(epoch)
         setup_seed(42 + epoch)
         if is_packed:
             # packed parquet: 按 row_group 聚簇 shuffle, 避免 DataLoader worker
@@ -229,14 +271,16 @@ if __name__ == "__main__":
                 mix_rgs=args.packed_mix_rgs)
         else:
             indices = torch.randperm(len(train_ds)).tolist()
+        indices = filter_validation_indices(indices, val_index_set)
+        indices = shard_dataset_indices(indices, args.batch_size)
         skip = start_step if (epoch == start_epoch and start_step > 0) else 0
-        batch_sampler = SkipBatchSampler(train_sampler or indices, args.batch_size, skip)
+        batch_sampler = SkipBatchSampler(indices, args.batch_size, skip)
         loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True)
         if skip > 0: 
             Logger(f'Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始')
-            train_epoch(epoch, loader, len(loader) + skip, start_step, wandb)
+            train_epoch(epoch, loader, val_loader, len(loader) + skip, start_step, wandb)
         else:
-            train_epoch(epoch, loader, len(loader), 0, wandb)
+            train_epoch(epoch, loader, val_loader, len(loader), 0, wandb)
     
     # ========== 9. 清理分布进程 ==========
     if dist.is_initialized():
