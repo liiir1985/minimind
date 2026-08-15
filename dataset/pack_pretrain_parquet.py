@@ -5,7 +5,7 @@ pack_pretrain_parquet.py
 
 递归扫描输入目录下所有 .parquet 文件（含子目录，按自然排序顺序处理），
 使用 dataset/lm_dataset.py 中 PretrainDataset 的 packing 方法
-（bos+eos 包裹、超长按 max_length stride 切块、长度降序 FFD +
+（bos+eos 包裹、超长在句子边界(中英文句号/换行符)处切块、长度降序 FFD +
 Bucketed Best-Fit 定长 bin 填充）生成 packed 数据集，
 输出到另一目录，按逻辑数据量（行数 x max_length x 4B）约 max-file-size
 一个 parquet 文件切分。
@@ -568,6 +568,15 @@ def main():
     tok.model_max_length = 10**9  # 消除超长文本 tokenize 警告 (纯打包脚本, 无模型约束)
     print(f"  bos={bos_id} eos={eos_id} pad={pad_id} vocab={tok.vocab_size}")
 
+    # 安全拆分的句子边界 token: token 解码后以中英文句号 (。.) 或换行符 (\n) 结尾。
+    # 注意必须用 decode 还原真实文本: 字节级 BPE 的 convert_ids_to_tokens 返回
+    # 乱码 (如 '。' -> 'ãĢĤ'), 直接 endswith 判不出来。
+    is_boundary = np.zeros(tok.vocab_size, dtype=bool)
+    for i in range(tok.vocab_size):
+        s = tok.decode([i], skip_special_tokens=True)
+        if s and (s.endswith('。') or s.endswith('.') or s.endswith('\n')):
+            is_boundary[i] = True
+
     # 写入缓冲行数: 默认按 max-length 自动, 缓冲内存控制在 ~256MB
     if args.flush_rows > 0:
         flush_rows = args.flush_rows
@@ -656,15 +665,29 @@ def main():
             total_packed += len(packer.finalized)
             packer.finalized.clear()
 
-    def process_ids(ids):
-        """单条文本 token 数组 (np.uint32) -> 加 bos/eos -> 切块 -> 进待打包队列
+    def enqueue(seg):
+        """内容 token 段 -> 加 bos/eos -> 进待打包队列 (攒够 mem_budget 落盘)"""
+        nonlocal pending, pending_tokens
+        n = len(seg) + 2
+        arr = np.empty(n, dtype=np.uint32)
+        arr[0] = bos_id
+        arr[1:-1] = seg
+        arr[-1] = eos_id
+        pending.append(arr)
+        pending_tokens += n
+        if pending_tokens >= mem_budget:
+            flush_pending()
+            flush_writer_buf()
 
-        超长文本 (n > max_length): 拆成多个满块, 每块 = bos + (max_length-2) 内容
-        + eos, 每块自成完整样本 (长度 = max_length, 自然单独成 bin);
-        剩余不足的尾巴块同样 bos + 剩余内容 + eos, 参与和其他文本拼接。
-        全程 numpy 操作, 避免 Python list of int 的内存膨胀。
+    def process_ids(ids):
+        """单条文本 token 数组 (np.uint32) -> 安全切分 -> 加 bos/eos -> 进待打包队列
+
+        超长文本 (n > max_length) 在句子边界处切开: 优先找当前窗口内最后一个
+        以中英文句号 (。.) 或换行符 (\n) 结尾的 token, 在其之后断开, 段以句号/
+        换行结尾且长度 <= max_length (可以不满); 窗口内找不到任何边界时才退化为
+        硬切, 防止死循环。全程 numpy 操作, 避免 Python list of int 的内存膨胀。
         """
-        nonlocal pending, pending_tokens, total_texts, total_raw_tokens
+        nonlocal total_texts, total_raw_tokens
         # 太短的序列直接跳过, 不参与打包 (也不计入统计)
         if min_seq_len > 0 and len(ids) < min_seq_len:
             return
@@ -672,40 +695,20 @@ def main():
         total_raw_tokens += n
         total_texts += 1
         if n > args.max_length:
-            cap = args.max_length - 2  # 每块可容纳的内容 token 数
-            i = 0
-            L = len(ids)
-            while L - i > cap:
-                chunk = np.empty(args.max_length, dtype=np.uint32)
-                chunk[0] = bos_id
-                chunk[1:args.max_length - 1] = ids[i:i + cap]
-                chunk[args.max_length - 1] = eos_id
-                pending.append(chunk)
-                pending_tokens += args.max_length
-                i += cap
-                if pending_tokens >= mem_budget:
-                    flush_pending()
-                    flush_writer_buf()
-            rem = L - i
-            tail = np.empty(rem + 2, dtype=np.uint32)
-            tail[0] = bos_id
-            tail[1:-1] = ids[i:]
-            tail[-1] = eos_id
-            pending.append(tail)
-            pending_tokens += rem + 2
-            if pending_tokens >= mem_budget:
-                flush_pending()
-                flush_writer_buf()
+            cap = args.max_length - 2  # 每段可容纳的内容 token 数上限
+            start, L = 0, len(ids)
+            while L - start > cap:
+                end = start + cap
+                bpos = np.nonzero(is_boundary[ids[start:end]])[0]
+                if len(bpos) == 0:
+                    cut = cap  # 窗口内无句子边界, 退化为硬切
+                else:
+                    cut = int(bpos[-1]) + 1  # 在边界 token 之后断开 (段以句号/换行结尾)
+                enqueue(ids[start:start + cut])
+                start += cut
+            enqueue(ids[start:])
         else:
-            arr = np.empty(n, dtype=np.uint32)
-            arr[0] = bos_id
-            arr[1:-1] = ids
-            arr[-1] = eos_id
-            pending.append(arr)
-            pending_tokens += n
-            if pending_tokens >= mem_budget:
-                flush_pending()
-                flush_writer_buf()
+            enqueue(ids)
 
     print("开始处理 ...")
     for fi, fpath in enumerate(files, 1):
