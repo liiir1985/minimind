@@ -56,7 +56,8 @@ def train_epoch(epoch, loader, val_loader, iters, start_step=0, wandb=None):
         input_ids = input_ids.to(args.device)
         labels = labels.to(args.device)
         last_step = step
-        lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
+        lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate,
+                    schedule=args.lr_schedule, warmup_steps=args.warmup_steps, decay_ratio=args.decay_ratio)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
 
@@ -125,6 +126,10 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=2, help="训练轮数")
     parser.add_argument("--batch_size", type=int, default=16, help="batch size")
     parser.add_argument("--learning_rate", type=float, default=1e-5, help="初始学习率")
+    parser.add_argument("--lr_schedule", type=str, default="cosine", choices=["cosine", "wsd"],
+                        help="LR schedule: cosine 或 wsd(Warmup-Stable-Decay)")
+    parser.add_argument("--warmup_steps", type=int, default=0, help="WSD warmup 步数 (仅 --lr_schedule wsd 时有效)")
+    parser.add_argument("--decay_ratio", type=float, default=0.1, help="WSD decay 占总步数比例 (仅 --lr_schedule wsd 时有效)")
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu", help="训练设备")
     parser.add_argument("--dtype", type=str, default="bfloat16", help="混合精度类型")
     parser.add_argument("--num_workers", type=int, default=8, help="数据加载线程数")

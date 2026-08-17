@@ -71,8 +71,28 @@ def Logger(content):
         print(content)
 
 
-def get_lr(current_step, total_steps, lr):
-    return lr*(0.1 + 0.45*(1 + math.cos(math.pi * current_step / total_steps)))
+def get_lr(current_step, total_steps, lr, schedule='cosine', warmup_steps=0, decay_ratio=0.1):
+    """统一 LR schedule 入口，支持 cosine 和 WSD (Warmup-Stable-Decay)。
+
+    cosine:  lr*(0.1 + 0.45*(1 + cos(π * step / total)))
+    wsd:     warmup(线性 0→lr) → stable(恒定 lr) → decay(线性 lr→0)
+             其中 decay 步数 = total_steps * decay_ratio，stable 为剩余步数
+    """
+    if schedule == 'wsd':
+        decay_steps = max(1, int(total_steps * decay_ratio))
+        stable_steps = total_steps - warmup_steps - decay_steps
+
+        if current_step < warmup_steps:
+            return lr * current_step / max(warmup_steps, 1)
+        elif current_step < warmup_steps + stable_steps:
+            return lr
+        else:
+            decay_step = current_step - warmup_steps - stable_steps
+            decay_progress = min(max(decay_step / max(decay_steps, 1), 0.0), 1.0)
+            return lr * (1.0 - decay_progress)
+
+    # cosine (default)
+    return lr * (0.1 + 0.45 * (1 + math.cos(math.pi * current_step / total_steps)))
 
 
 def build_dsv4_mini_config(args, inference: bool = False):
