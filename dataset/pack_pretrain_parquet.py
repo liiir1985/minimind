@@ -447,6 +447,8 @@ def parse_args():
     p.add_argument("--max-length", type=int, default=2000, help="packed 序列长度 (默认 2000, 同 train_pretrain)")
     p.add_argument("--min-seq-len", type=int, default=0,
                    help="单条文本 tokenize 后长度小于此值则直接跳过 (默认 0=不过滤)")
+    p.add_argument("--short-seq-keep-prob", type=float, default=0.01,
+                   help="tokenize 后长度小于 --min-seq-len 的短文本保留概率 (默认 0=全部跳过; 例 0.01=保留1%%)")
     p.add_argument("--text-column", default="text", help="输入 parquet 的文本列名 (默认 text)")
     p.add_argument("--max-file-size", type=str, default="4GiB", help="单输出文件物理大小上限, 压缩后磁盘占用 (默认 4GiB)")
     p.add_argument("--mem-budget", type=str, default="200M", help="待打包序列 token 总量预算 (默认 200M token)")
@@ -550,6 +552,8 @@ def main():
     max_batch_mem = parse_size(args.max_batch_mem)
     if not (0 <= args.sample_prob <= 1):
         raise ValueError(f"--sample-prob 必须在 [0, 1] 内, 得到 {args.sample_prob}")
+    if not (0 <= args.short_seq_keep_prob <= 1):
+        raise ValueError(f"--short-seq-keep-prob 必须在 [0, 1] 内, 得到 {args.short_seq_keep_prob}")
     shuffle_enabled = args.shuffle_buckets > 0
     if shuffle_enabled and args.resume:
         raise ValueError("--shuffle-buckets > 0 暂不支持 --resume；请从头生成 shuffled packed 数据")
@@ -642,6 +646,10 @@ def main():
     total_raw_tokens = 0
     total_packed = 0
     min_seq_len = args.min_seq_len
+    short_seq_keep_prob = args.short_seq_keep_prob
+    short_seq_seen = 0
+    short_seq_dropped = 0
+    short_seq_rng = None
     t_start = time.time()
 
     def flush_pending():
@@ -687,10 +695,13 @@ def main():
         换行结尾且长度 <= max_length (可以不满); 窗口内找不到任何边界时才退化为
         硬切, 防止死循环。全程 numpy 操作, 避免 Python list of int 的内存膨胀。
         """
-        nonlocal total_texts, total_raw_tokens
-        # 太短的序列直接跳过, 不参与打包 (也不计入统计)
+        nonlocal total_texts, total_raw_tokens, short_seq_seen, short_seq_dropped
+        # 太短的序列按概率保留, 默认全跳过; 被跳过的不参与打包 (也不计入输入文本统计)
         if min_seq_len > 0 and len(ids) < min_seq_len:
-            return
+            short_seq_seen += 1
+            if short_seq_keep_prob <= 0 or short_seq_rng.random() >= short_seq_keep_prob:
+                short_seq_dropped += 1
+                return
         n = len(ids) + 2  # +bos +eos
         total_raw_tokens += n
         total_texts += 1
@@ -726,6 +737,7 @@ def main():
         nrows = pf.metadata.num_rows
         file_seed = (args.sample_seed + zlib.adler32(fname.encode("utf-8"))) & 0xFFFFFFFF
         sample_rng = np.random.default_rng(file_seed)
+        short_seq_rng = np.random.default_rng((file_seed + 0x9E3779B9) & 0xFFFFFFFF)
         # 估算 text 列平均行大小 (未压缩字节数, 真实文本近似 UTF-8 大小)
         try:
             col_idx = pf.metadata.schema.names.index(args.text_column)
@@ -864,6 +876,10 @@ def main():
     out_files = [f for f in os.listdir(args.output_dir) if re.fullmatch(r"part-\d{5}\.parquet", f)]
     print(f"\n完成! 用时 {elapsed/60:.1f} 分钟")
     print(f"  输入文本: {total_texts:,} 条, 原始 token: {total_raw_tokens:,}")
+    if min_seq_len > 0:
+        kept = short_seq_seen - short_seq_dropped
+        print(f"  短文本过滤(<{min_seq_len} token): 命中 {short_seq_seen:,} 条, 保留 {kept:,} 条"
+              f" ({short_seq_keep_prob:g}), 丢弃 {short_seq_dropped:,} 条")
     print(f"  输出 packed samples: {total_packed:,}  (每条 {args.max_length} token)")
     print(f"  输出文件: {len(out_files)} 个 ({args.output_dir})")
     for f in sorted(out_files):
