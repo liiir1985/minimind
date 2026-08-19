@@ -189,7 +189,13 @@ if __name__ == "__main__":
     
     # ========== 5. 定义模型、数据、优化器 ==========
     model, tokenizer = init_model(lm_config, args.from_weight, device=args.device, model_type=args.model_type)
-    train_ds = SFTDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
+    if args.data_path.endswith('.parquet'):
+        list_name = 'messages'
+        file_format = 'parquet'
+    else:
+        list_name = 'conversations'
+        file_format = 'json'
+    train_ds = SFTDataset(args.data_path, tokenizer, max_length=args.max_seq_len, list_name=list_name, file_format=file_format)
     val_ds, val_index_set = build_in_memory_validation_dataset(train_ds, args.val_ratio, args.val_seed, Logger)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=0,
                             pin_memory=(device_type == "cuda")) if val_ds is not None else None

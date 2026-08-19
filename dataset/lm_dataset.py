@@ -433,12 +433,13 @@ def shard_dataset_indices(indices, batch_size):
 
 
 class SFTDataset(Dataset):
-    def __init__(self, jsonl_path, tokenizer, max_length=1024):
+    def __init__(self, jsonl_path, tokenizer, max_length=1024, list_name='conversations', file_format='json'):
         super().__init__()
         self.tokenizer = tokenizer
         self.max_length = max_length
-        features = Features({'conversations': [{'role': Value('string'), 'content': Value('string'), 'reasoning_content': Value('string'), 'tools': Value('string'), 'tool_calls': Value('string')}]})
-        self.samples = load_dataset('json', data_files=jsonl_path, split='train', features=features)
+        self.list_name = list_name
+        features = Features({list_name: [{'role': Value('string'), 'content': Value('string'), 'reasoning_content': Value('string'), 'tools': Value('string'), 'tool_calls': Value('string')}]})
+        self.samples = load_dataset(file_format, data_files=jsonl_path, split='train', features=features)
         self.bos_id = tokenizer(f'{tokenizer.bos_token}assistant\n', add_special_tokens=False).input_ids
         self.eos_id = tokenizer(f'{tokenizer.eos_token}\n', add_special_tokens=False).input_ids
 
@@ -482,7 +483,7 @@ class SFTDataset(Dataset):
 
     def __getitem__(self, index):
         sample = self.samples[index]
-        conversations = pre_processing_chat(sample['conversations'])
+        conversations = pre_processing_chat(sample[self.list_name])
         prompt = self.create_chat_prompt(conversations)
         prompt = post_processing_chat(prompt)
         input_ids = self.tokenizer(prompt).input_ids[:self.max_length]
